@@ -61,6 +61,8 @@ class SshTransport(Transport):
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4", "-o", "ConnectTimeout=20",
             "-o", "ControlMaster=auto", "-o", f"ControlPath={self.sock}", "-o", "ControlPersist=600",
             "-o", "Compression=no", "-o", "IPQoS=throughput",
+            # Never wait on a password/passphrase prompt: there is no terminal, a refused key must fail fast.
+            "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no", "-o", "KbdInteractiveAuthentication=no",
             "-p", str(target.port), *extra_opts,
         ]
         if target.proxy_command:
@@ -81,7 +83,14 @@ class SshTransport(Transport):
         loop = asyncio.get_running_loop()
         end = loop.time() + timeout
         last = master_err = ""
+        denied_since = None
         while loop.time() < end:
+            if "Permission denied" in master_err:
+                # Some hosts never install the account key (seen repeatedly on Vast). Two minutes of refusals on an
+                # otherwise reachable sshd is a host fault, not a slow boot.
+                denied_since = denied_since or loop.time()
+                if loop.time() - denied_since > float(os.environ.get("GF_SSH_DENIED_S", 120)):
+                    break
             if self.master is None or self.master.returncode is not None:
                 if self.master is not None and self.master.stderr:
                     master_err = (await self.master.stderr.read()).decode(errors="replace").strip()[-300:] \
