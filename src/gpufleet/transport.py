@@ -69,6 +69,11 @@ class SshTransport(Transport):
             self.opts += ["-o", f"ProxyCommand={target.proxy_command}"]
         self.dest = f"{target.user}@{target.host}"
         self.master: asyncio.subprocess.Process | None = None
+        # sshd allows MaxSessions (10 by default) sessions per connection, and everything here shares one: the agent
+        # channel, a task's output pulls, the next job's input pushes, setup. Past the limit a session is refused
+        # ("Session open refused by peer"), which read as a box fault and drained a healthy box. One session is the
+        # agent's; the rest queue here.
+        self._sessions = asyncio.Semaphore(int(os.environ.get("GF_SSH_SESSIONS", 6)))
 
     def _ssh(self) -> list[str]:
         return ["ssh", *self.opts]
@@ -130,7 +135,8 @@ class SshTransport(Transport):
         return self.master is not None and self.master.returncode is None
 
     async def exec(self, cmd: str, timeout: float = 600, stdin: bytes | None = None) -> tuple[int, str]:
-        return await _run([*self._ssh(), self.dest, cmd], timeout, stdin)
+        async with self._sessions:
+            return await _run([*self._ssh(), self.dest, cmd], timeout, stdin)
 
     async def spawn(self, cmd: str) -> asyncio.subprocess.Process:
         return await asyncio.create_subprocess_exec(*self._ssh(), self.dest, cmd, stdin=asyncio.subprocess.PIPE,
@@ -154,8 +160,9 @@ class SshTransport(Transport):
         rc, out = await self.exec(f"mkdir -p {shlex.quote(parent)}", 60)
         if rc:
             raise TransportError(f"mkdir {parent}: {out[-300:]}", rc)
-        rc, out = await _run([*self._rsync(s), src.rstrip("/") + trail, f"{self.dest}:{dst.rstrip('/') + trail}"],
-                             timeout)
+        async with self._sessions:
+            rc, out = await _run([*self._rsync(s), src.rstrip("/") + trail, f"{self.dest}:{dst.rstrip('/') + trail}"],
+                                 timeout)
         if rc:
             raise TransportError(f"push {s.src} -> {dst} failed rc={rc}: {out[-400:]}", rc)
 
@@ -163,7 +170,8 @@ class SshTransport(Transport):
         src = self.abspath(s.src)
         dst = os.path.expanduser(s.dst)
         os.makedirs(dst if src.endswith("/") else os.path.dirname(dst) or ".", exist_ok=True)
-        rc, out = await _run([*self._rsync(s), f"{self.dest}:{src}", dst], timeout)
+        async with self._sessions:
+            rc, out = await _run([*self._rsync(s), f"{self.dest}:{src}", dst], timeout)
         if rc == 23 and ("No such file" in out or "vanished" in out):
             return  # nothing to pull for this task (e.g. no logs written)
         if rc:
