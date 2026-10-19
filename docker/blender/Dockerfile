@@ -25,7 +25,7 @@ RUN set -e; f=blender-$BLV-linux-x64.tar.xz; ok=; \
 
 FROM fetch AS ffmpeg
 # BtbN static GPL build: includes h264_nvenc/hevc_nvenc (the distro-independent static builds most images ship do not).
-ARG FFURL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-linux64-gpl-7.1.tar.xz
+ARG FFURL=https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
 RUN set -e; curl -fsSL --retry 3 -o /tmp/ff.tar.xz "$FFURL"; mkdir -p /opt/ffmpeg; \
     tar -xf /tmp/ff.tar.xz -C /opt/ffmpeg --strip-components=1; rm /tmp/ff.tar.xz; \
     rm -rf /opt/ffmpeg/doc /opt/ffmpeg/man /opt/ffmpeg/bin/ffplay
