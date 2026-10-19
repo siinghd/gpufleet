@@ -85,16 +85,22 @@ class SshTransport(Transport):
             if self.master is None or self.master.returncode is not None:
                 if self.master is not None and self.master.stderr:
                     last = (await self.master.stderr.read()).decode(errors="replace").strip()[-300:] or last
+                # ssh keeps the FIRST value of an option, so the master's own settings go before self.opts. With
+                # ControlPersist the master would fork into the background and look dead to us.
                 self.master = await asyncio.create_subprocess_exec(
-                    "ssh", *self.opts, "-o", "ControlMaster=yes", "-N", self.dest,
+                    "ssh", "-o", "ControlMaster=yes", "-o", "ControlPersist=no", *self.opts, "-N", self.dest,
                     stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
             if self.master.returncode is not None:
                 await asyncio.sleep(3)
                 continue
-            rc, out = await _run(["ssh", *self.opts, "-o", "ControlMaster=no", self.dest, "true"], 30)
+            # Only ever ask the master's control socket: a plain probe connection would be a second SSH
+            # connection, which Colab refuses (one per runtime) and which can knock the master over.
+            rc, out = await _run(["ssh", *self.opts, "-O", "check", self.dest], 10)
             if rc == 0:
-                return
+                rc, out = await _run(["ssh", *self.opts, self.dest, "true"], 30)
+                if rc == 0:
+                    return
             last = out.strip()[-300:] or last
         if self.master and self.master.returncode is None:
             self.master.kill()

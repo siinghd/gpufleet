@@ -138,6 +138,7 @@ class Server:
 async def serve(cfg: dict | None = None) -> None:
     cfg = cfg or config.load()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     fleet = Fleet(cfg, build_providers(cfg))
     path = cfg["socket"]
     Path(path).parent.mkdir(parents=True, exist_ok=True)
