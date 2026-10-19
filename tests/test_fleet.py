@@ -321,3 +321,28 @@ async def test_stuck_destroying_box_is_retried_by_reconciler(tmp):
     await fleet.reconcile()
     assert "77" not in prov.live
     assert fleet.store.one("SELECT status FROM boxes WHERE id='bstuck'")["status"] == "destroyed"
+
+
+async def test_include_filters_and_absolute_box_paths(tmp):
+    prov = Fake()
+    fleet = Fleet(make_cfg(tmp), {"fake": prov}, local_boxes=True)
+    # The command writes under an absolute path; only *.mp4 must come back.
+    box_out = tmp / "abs-out"
+    cmd = f"mkdir -p {box_out}/m && echo v > {box_out}/m/clip.mp4 && echo junk > {box_out}/m/frame.png"
+    jid = fleet.submit(spec(tmp, units=["a"], command=cmd,
+                            outputs=[{"src": f"{box_out}/", "dst": str(tmp / "got") + "/", "include": ["*.mp4"]}]))
+    assert (await run_until(fleet, jid))["status"] == "done"
+    assert (tmp / "got/m/clip.mp4").exists() and not (tmp / "got/m/frame.png").exists()
+    await fleet.shutdown(destroy=True)
+
+
+async def test_max_per_box_spreads_or_serialises(tmp):
+    prov = Fake()
+    fleet = Fleet(make_cfg(tmp, max_boxes=1), {"fake": prov}, local_boxes=True)
+    log = tmp / "concurrency.log"
+    cmd = (f'mkdir -p out; echo start >> {log}; n=$(grep -c start {log}); e=$(grep -c end {log} || true); '
+           f'echo $((n - e)) >> {tmp}/peak; sleep 0.3; echo end >> {log}; echo x > out/$GF_TASK.txt')
+    jid = fleet.submit(spec(tmp, units=["a", "b", "c"], command=cmd, gpu_share=0.25, max_per_box=1))
+    assert (await run_until(fleet, jid))["status"] == "done"
+    assert max(int(x) for x in (tmp / "peak").read_text().split()) == 1  # 4 lanes, but never 2 at once
+    await fleet.shutdown(destroy=True)

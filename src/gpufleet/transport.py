@@ -139,9 +139,9 @@ class SshTransport(Transport):
 
     def _rsync(self, s: Sync) -> list[str]:
         e = " ".join(shlex.quote(x) for x in self._ssh())
-        argv = ["rsync", "-a", "--partial", "--inplace", "--no-owner", "--no-group", "-e", e]
-        for x in s.exclude:
-            argv += ["--exclude", x]
+        argv = ["rsync", "-a", "--partial", "--inplace", "--no-owner", "--no-group", "-e", e, *s.filters()]
+        if s.include:
+            argv.append("--prune-empty-dirs")
         if s.delete:
             argv.append("--delete")
         return argv
@@ -201,7 +201,7 @@ class LocalTransport(Transport):
         dst = self.abspath(s.dst)
         trail = "/" if os.path.isdir(src) else ""
         os.makedirs(dst if trail else os.path.dirname(dst), exist_ok=True)
-        argv = ["rsync", "-a", *sum((["--exclude", x] for x in s.exclude), []), *(["--delete"] if s.delete else []),
+        argv = ["rsync", "-a", *s.filters(), *(["--delete"] if s.delete else []),
                 src.rstrip("/") + trail, dst.rstrip("/") + trail]
         rc, out = await _run(argv, timeout)
         if rc:
@@ -211,7 +211,7 @@ class LocalTransport(Transport):
         src = self.abspath(s.src)
         dst = os.path.expanduser(s.dst)
         os.makedirs(dst if src.endswith("/") else os.path.dirname(dst) or ".", exist_ok=True)
-        rc, out = await _run(["rsync", "-a", *sum((["--exclude", x] for x in s.exclude), []), src, dst], timeout)
+        rc, out = await _run(["rsync", "-a", *s.filters(), src, dst], timeout)
         if rc == 23:
             return
         if rc:

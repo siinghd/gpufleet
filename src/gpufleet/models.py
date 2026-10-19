@@ -83,13 +83,21 @@ class Sync:
     dst: str
     exclude: tuple[str, ...] = ()
     delete: bool = False
+    include: tuple[str, ...] = ()  # if set: only these patterns (directories are always traversed)
 
     @classmethod
     def parse(cls, d: dict | str) -> "Sync":
         if isinstance(d, str):
             return cls(src=d, dst=d)
         return cls(src=d["src"], dst=d.get("dst", d["src"]), exclude=tuple(d.get("exclude", ())),
-                   delete=bool(d.get("delete", False)))
+                   delete=bool(d.get("delete", False)), include=tuple(d.get("include", ())))
+
+    def filters(self) -> list[str]:
+        """rsync filter arguments: excludes first, then the include whitelist."""
+        out = sum((["--exclude", x] for x in self.exclude), [])
+        if self.include:
+            out += ["--include", "*/", *sum((["--include", x] for x in self.include), []), "--exclude", "*"]
+        return out
 
 
 @dc.dataclass(frozen=True)
@@ -123,6 +131,8 @@ class JobSpec:
     setup: str = ""  # runs once per box per distinct setup text (cached by hash)
     env: dict = dc.field(default_factory=dict)
     gpu_share: float = 1.0  # lanes per GPU = 1/gpu_share to start with; telemetry may raise it
+    max_per_box: int = 0  # at most this many of the job's tasks on one box at once (0 = no limit); 1 for commands
+                          # that share fixed paths on the box
     timeout_factor: float = 3.0  # a task running longer than this x its expected time is killed and retried
     timeout_min_s: float = 900  # ...but never before this (first runs on a new GPU have no good estimate)
     max_attempts: int = 3

@@ -220,6 +220,11 @@ class Fleet:
     def _workspace(self, spec: JobSpec) -> str:
         return f"{spec.project}"
 
+    def _box_path(self, spec: JobSpec, p: str, task: dict) -> str:
+        """A box-side path from a spec: absolute paths are used as given, relative ones live in the workspace."""
+        p = self._subst(p, task, spec)
+        return p if p.startswith("/") else f"{self._workspace(spec)}/{p}"
+
     # ================================================================================================ dispatch
     async def _prepare(self, box: BoxRT, jid: str) -> None:
         """Inputs + setup for a job on a box. Inputs land in the project workspace, so a later job of the same project
@@ -232,7 +237,8 @@ class Fleet:
         async def push(s: Sync):
             async with sem:
                 dst = s.dst if s.dst.startswith("/") else f"{ws}/{s.dst}"
-                await box.transport.push(Sync(src=s.src, dst=dst, exclude=s.exclude, delete=s.delete))
+                await box.transport.push(Sync(src=s.src, dst=dst, exclude=s.exclude, delete=s.delete,
+                                              include=s.include))
 
         await asyncio.gather(*(push(s) for s in spec.inputs))
         if spec.setup and spec.setup_key() not in box.setups:
@@ -272,9 +278,9 @@ class Fleet:
             local = os.path.expanduser(self._subst(c.dst, task, spec))
             if os.path.exists(local) and (not os.path.isdir(local) or any(os.scandir(local))):
                 src = local.rstrip("/") + ("/" if os.path.isdir(local) else "")
-                dst = f"{self._workspace(spec)}/{self._subst(c.src, task, spec)}"
+                dst = self._box_path(spec, c.src, task)
                 try:
-                    await box.transport.push(Sync(src=src, dst=dst), timeout=1800)
+                    await box.transport.push(Sync(src=src, dst=dst, include=c.include), timeout=1800)
                     self.store.event("checkpoint_restored", task["id"], box=box.id, path=c.src)
                 except TransportError as e:
                     log.warning("checkpoint restore for %s: %s", task["id"], e)
@@ -285,10 +291,10 @@ class Fleet:
             return True
         ok = True
         for c in spec.checkpoint:
-            src = f"{self._workspace(spec)}/{self._subst(c.src, task, spec)}"
+            src = self._box_path(spec, c.src, task)
             try:
-                await box.transport.pull(Sync(src=src, dst=self._subst(c.dst, task, spec), exclude=c.exclude),
-                                         timeout=timeout)
+                await box.transport.pull(Sync(src=src, dst=self._subst(c.dst, task, spec), exclude=c.exclude,
+                                              include=c.include), timeout=timeout)
             except TransportError as e:
                 ok = False
                 log.info("checkpoint pull %s: %s", task["id"], e)
@@ -302,8 +308,8 @@ class Fleet:
             try:
                 async with self._pulls:
                     await asyncio.gather(*(box.transport.pull(Sync(
-                        src=f"{self._workspace(spec)}/{self._subst(s.src, task, spec)}",
-                        dst=self._subst(s.dst, task, spec), exclude=s.exclude)) for s in spec.outputs))
+                        src=self._box_path(spec, s.src, task), dst=self._subst(s.dst, task, spec),
+                        exclude=s.exclude, include=s.include)) for s in spec.outputs))
                 return
             except TransportError:
                 if attempt == len(delays):
@@ -403,12 +409,22 @@ class Fleet:
                 if isinstance(st, Exception):
                     continue
                 for lane in box.free_lanes():
+                    if spec.max_per_box and self._running_on(jid, box) >= spec.max_per_box:
+                        break
                     task = self._lease(jid, box)
                     if not task:
                         break
                     self._start(box, lane, jid, task)
                 if not box.free_lanes():
                     break
+
+    def _running_on(self, jid: str, box: BoxRT) -> int:
+        live = {l.task for l in box.lanes if l.task}
+        if not live:
+            return 0
+        marks = ",".join("?" * len(live))
+        return self.store.one(f"SELECT COUNT(*) AS n FROM tasks WHERE job_id=? AND id IN ({marks})",
+                              [jid, *live])["n"]
 
     def speculate(self) -> None:
         """Tail: duplicate the slowest running task of a job on an idle box that is at least as fast."""
@@ -876,7 +892,10 @@ class Fleet:
         free = booting = 0
         for b in self.boxes.values():
             if b.status == "ready" and self._fits(spec, b) and self._can_take(jid, b):
-                free += len(b.free_lanes())
+                room = len(b.free_lanes())
+                if spec.max_per_box:
+                    room = min(room, max(0, spec.max_per_box - self._running_on(jid, b)))
+                free += room
             elif b.status in ("requested", "booting") and b.profile == spec.need.profile:
                 booting += max(1, round(b.num_gpus / max(spec.gpu_share, 0.01)))
         return free, booting
