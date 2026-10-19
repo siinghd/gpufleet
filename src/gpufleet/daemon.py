@@ -36,6 +36,10 @@ AGENT_SRC = Path(__file__).with_name("agent.py")
 MACHINE_FAULT_RCS = {3, 75}  # job scripts exit 3 for "no usable GPU" (toon-studio LIB_REQUIRE_GPU), 75 = bad box
 
 
+class SetupError(TransportError):
+    """A job's setup command failed on the box (the job's fault unless it exits 3/75)."""
+
+
 def _id(prefix: str) -> str:
     return prefix + secrets.token_hex(4)
 
@@ -240,12 +244,15 @@ class Fleet:
                 await box.transport.push(Sync(src=s.src, dst=dst, exclude=s.exclude, delete=s.delete,
                                               include=s.include))
 
+        rc, out = await box.transport.exec(f"mkdir -p {shlex.quote(box.transport.abspath(ws))}", 60)
+        if rc:
+            raise TransportError(f"workspace: {out[-300:]}", rc)
         await asyncio.gather(*(push(s) for s in spec.inputs))
         if spec.setup and spec.setup_key() not in box.setups:
             rc, out = await box.transport.exec(
                 f"cd {shlex.quote(box.transport.abspath(ws))} && {spec.setup}", timeout=1800)
             if rc:
-                raise TransportError(f"setup failed rc={rc}: {out[-500:]}", rc)
+                raise SetupError(f"setup failed rc={rc}: {out[-800:]}", rc)
             box.setups.add(spec.setup_key())
         self.store.event("prepared", box.id, job=jid, secs=round(time.time() - t0, 1))
 
@@ -403,7 +410,12 @@ class Fleet:
                     if exc is not None:
                         log.warning("prepare %s on %s failed: %s", jid, box.id, exc)
                         self.store.event("prepare_failed", box.id, job=jid, error=str(exc)[-300:])
-                        self._box_fault(box, f"prepare failed: {exc}")
+                        if isinstance(exc, SetupError) and exc.rc not in MACHINE_FAULT_RCS:
+                            # The job's own setup is broken; another box would fail the same way. Fail the job,
+                            # keep the box for other work.
+                            self._fail_job(jid, str(exc))
+                        else:
+                            self._box_fault(box, f"prepare failed: {exc}")
                         break
                     st = "ok"
                 if isinstance(st, Exception):
@@ -606,6 +618,16 @@ class Fleet:
             cost = self.store.one("SELECT cost FROM jobs WHERE id=?", [jid])["cost"]
             self.store.event("job_" + status, jid, cost=cost)
             self._notify(jid, ev="job_" + status, cost=round(cost, 4), failed=[r["id"] for r in failed])
+
+    def _fail_job(self, jid: str, why: str) -> None:
+        for r in self.store.q("SELECT id FROM tasks WHERE job_id=? AND status IN ('queued','running')", [jid]):
+            self._cancel_task(r["id"])
+        self.store.x("UPDATE jobs SET status='failed', finished_at=?, error=?, cursor=COALESCE(cursor, 0) WHERE id=?",
+                     [time.time(), why[-2000:], jid])
+        if self._spec(jid).range_:
+            self.store.x("UPDATE jobs SET cursor=? WHERE id=?", [self._spec(jid).range_[1] + 1, jid])
+        self.store.event("job_failed", jid, error=why[-500:])
+        self._notify(jid, ev="job_failed", error=why[-1500:])
 
     def cancel_job(self, jid: str) -> None:
         self.store.x("UPDATE jobs SET status='cancelled', finished_at=? WHERE id=?", [time.time(), jid])

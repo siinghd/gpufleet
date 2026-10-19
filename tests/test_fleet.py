@@ -346,3 +346,13 @@ async def test_max_per_box_spreads_or_serialises(tmp):
     assert (await run_until(fleet, jid))["status"] == "done"
     assert max(int(x) for x in (tmp / "peak").read_text().split()) == 1  # 4 lanes, but never 2 at once
     await fleet.shutdown(destroy=True)
+
+
+async def test_broken_setup_fails_the_job_and_keeps_the_box(tmp):
+    prov = Fake()
+    fleet = Fleet(make_cfg(tmp, idle_s=30), {"fake": prov}, local_boxes=True)
+    jid = fleet.submit(spec(tmp, units=["a"], setup="exit 9"))
+    st = await run_until(fleet, jid)
+    assert st["status"] == "failed"
+    assert len(prov.launched) == 1 and list(prov.live)  # not destroyed, not replaced
+    await fleet.shutdown(destroy=True)
