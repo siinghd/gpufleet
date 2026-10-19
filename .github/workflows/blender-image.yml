@@ -21,7 +21,8 @@ jobs:
         with:
           context: docker/blender
           platforms: linux/amd64
-          push: true
+          # zstd layers: smaller than gzip and much faster to unpack on the GPU host (boot time is mostly the pull)
+          outputs: type=image,push=true,compression=zstd,compression-level=12,force-compression=true
           tags: |
             ghcr.io/${{ github.repository_owner }}/gpufleet-blender:5.2.2
             ghcr.io/${{ github.repository_owner }}/gpufleet-blender:latest

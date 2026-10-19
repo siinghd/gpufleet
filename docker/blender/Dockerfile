@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # gpufleet "blender" profile image: Blender + an NVENC-capable ffmpeg on a small CUDA base, nothing else.
 # Cold boots on GPU marketplaces are dominated by the image pull, so every layer here earns its size:
-#   - nvidia/cuda base: tiny and already cached on many hosts (only our layers are pulled)
+#   - ubuntu base: ~30 MB and already cached on most hosts (only our layers are pulled)
 #   - Blender trimmed of what a headless render never touches (static libpython, UI translations)
 #   - each big tree in its own layer, so a Blender bump leaves the ffmpeg layer byte-identical
 # Built by .github/workflows/blender-image.yml for linux/amd64.
@@ -21,6 +21,10 @@ RUN set -e; f=blender-$BLV-linux-x64.tar.xz; ok=; \
     done; [ -n "$ok" ]; \
     mkdir -p /opt/blender && tar -xf /tmp/$f -C /opt/blender --strip-components=1 && rm /tmp/$f; \
     find /opt/blender -name 'libpython*.a' -delete; \
+    # NVIDIA-only boxes: AMD (HIP) kernels and the AMD/Intel denoiser plugins are dlopen()ed only on those GPUs.
+    # (libhiprt, libsycl and the oneAPI kernel library stay: the blender binary links them directly.)
+    rm -f /opt/blender/5.2/scripts/addons_core/cycles/lib/kernel_gfx*.fatbin.zst \
+          /opt/blender/lib/libOpenImageDenoise_device_hip.so* /opt/blender/lib/libOpenImageDenoise_device_sycl.so*; \
     find /opt/blender -path '*/datafiles/locale/*' -mindepth 1 -maxdepth 4 -type d ! -name languages -exec rm -rf {} + 2>/dev/null || true
 
 FROM fetch AS ffmpeg
@@ -30,7 +34,10 @@ RUN set -e; curl -fsSL --retry 3 -o /tmp/ff.tar.xz "$FFURL"; mkdir -p /opt/ffmpe
     tar -xf /tmp/ff.tar.xz -C /opt/ffmpeg --strip-components=1; rm /tmp/ff.tar.xz; \
     rm -rf /opt/ffmpeg/doc /opt/ffmpeg/man /opt/ffmpeg/bin/ffplay
 
-FROM nvidia/cuda:12.8.1-base-ubuntu24.04
+# Plain Ubuntu, not nvidia/cuda: Blender ships its own CUDA/OptiX kernels and the NVIDIA container runtime mounts the
+# driver libraries (libcuda, libnvoptix, EGL, NVENC) when these variables are set. Ubuntu's base layer is the one
+# most likely to be cached on a host already.
+FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive NVIDIA_DRIVER_CAPABILITIES=all NVIDIA_VISIBLE_DEVICES=all
 # Runtime libraries Blender needs headless (X/GL client libs are linked even in background mode), EGL via glvnd for
 # EEVEE, python3 + numpy for scene scripts and checks, rsync/openssh for gpufleet.
