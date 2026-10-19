@@ -24,7 +24,8 @@ DEFAULTS: dict = {
     "scale_delay_s": 45,  # a queued task waits this long for a free lane before we rent another box
     "idle_s": 300,  # an idle box is kept this long for reuse
     "reuse_max_age_s": 4800,  # no new work after this age (boxes get flaky, contracts end)
-    "hard_ttl_s": 7200,  # destroyed at this age no matter what (the box also self-destroys on Vast)
+    "hard_ttl_s": 7200,  # deadline for a box; extended in 30 min steps while it is busy and answering...
+    "box_max_life_s": 43200,  # ...up to this absolute cap, which is also when Vast boxes self-destroy
     "boot_timeout_s": 480,  # a host still pulling the image after 8 min is a slow host: destroy, rent another
     "max_parallel_boots": 3,
     "boot_retries": 3,

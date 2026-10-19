@@ -706,7 +706,7 @@ class Fleet:
             self.boxes[bid] = box
             t0 = time.time()
             try:
-                box.ext_id = await prov.launch(o, label, prof, float(self.cfg["hard_ttl_s"]))
+                box.ext_id = await prov.launch(o, label, prof, float(self.cfg.get("box_max_life_s", 43200)))
                 box.status = "booting"
                 self.store.update("boxes", bid, ext_id=box.ext_id, status="booting")
                 self.store.event("box_launch", bid, provider=o.provider, gpu=o.gpu_name, price_h=o.price_h,
@@ -1122,6 +1122,11 @@ class Fleet:
             recent = [t for t in b.tel if t[0] > now - 45]
             if len(recent) < 6:
                 continue
+            # Only worth a lane if queued work could actually run in it.
+            if not any(self.has_queued(j) and self._fits(self._spec(j), b) and self._can_take(j, b)
+                       and (not self._spec(j).max_per_box or self._running_on(j, b) < self._spec(j).max_per_box)
+                       for j in self.active_jobs()):
+                continue
             util = sum(t[1] for t in recent) / len(recent)
             mem = max(t[2] for t in recent)
             tot = recent[-1][3]
@@ -1194,6 +1199,12 @@ class Fleet:
         queued_any = any(self.has_queued(j) for j in self.active_jobs())
         for b in list(self.boxes.values()):
             row = self.store.one("SELECT hard_deadline FROM boxes WHERE id=?", [b.id])
+            if (row and now > row["hard_deadline"] and b.status in ("ready", "draining") and b.busy()
+                    and now - b.last_seen < 60 and now - b.created < float(self.cfg.get("box_max_life_s", 43200))):
+                # Long task on a healthy box: killing it at the deadline would throw away the render. Extend.
+                self.store.update("boxes", b.id, hard_deadline=now + 1800)
+                self.store.event("deadline_extended", b.id, busy=b.busy())
+                continue
             if row and now > row["hard_deadline"]:
                 b.lost = b.lost or b.status == "parked"
                 await self._destroy(b, "hard deadline" if b.status != "parked" else "parked too long")
