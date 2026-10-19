@@ -95,6 +95,14 @@ Commands see `GF_UNIT` (named units) or `GF_LO`/`GF_HI` (ranges), `GF_TASK`, `GF
 Exit 3 means "this box is broken" (e.g. no usable GPU): the task moves to another machine and the machine is
 recorded.
 
+## Object storage (optional)
+
+Mark a transfer `"via": "r2"` to move it through Cloudflare R2 (or any S3 API) instead of rsync over SSH: the tree is
+packed once into a zstd tar named by its content hash, uploaded once, and every box downloads it in parallel straight
+from the store; outputs go up from the box and come back the same way. Boxes only ever get presigned URLs for single
+objects, never credentials. Configure with `~/.config/gpufleet/r2.env` (`R2_ENDPOINT`, `R2_BUCKET`,
+`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`; use a token scoped to one bucket). Without it, `via` falls back to rsync.
+
 ## Profiles
 
 A profile is the software a box needs: an image for Docker providers and an idempotent bootstrap that installs or
