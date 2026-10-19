@@ -56,6 +56,20 @@ async def one(gpu: str, out: Path) -> dict:
         res["kv"] = dict(l.split("=", 1) for l in text.splitlines() if "=" in l and not l.startswith("BENCH"))
         res["total_s"] = round(time.time() - t0, 1)
         await tr.close()
+        # Park/unpark: how fast does a stopped box come back?
+        await v.park(ext)
+        await asyncio.sleep(20)
+        t2 = time.time()
+        try:
+            tgt2 = await v.unpark(ext, time.time() + 180)
+            tr2 = SshTransport(f"probe2{ext}", tgt2, STATE, v.ssh_options())
+            await tr2.open(timeout=180)
+            rc2, _ = await tr2.exec("test -x /work/probe/blender/blender && nvidia-smi -L", 60)
+            res["unpark_s"] = round(time.time() - t2, 1)
+            res["unpark_files_kept"] = rc2 == 0
+            await tr2.close()
+        except Exception as e:
+            res["unpark_error"] = repr(e)[-200:]
     except Exception as e:
         res["error"] = repr(e)
     finally:

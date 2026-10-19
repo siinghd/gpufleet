@@ -1,0 +1,22 @@
+# gpufleet scheduler daemon. Install: sudo cp deploy/fleetd.service /etc/systemd/system/ && sudo systemctl
+# daemon-reload && sudo systemctl enable --now fleetd. Edit User/paths for your machine.
+# Restarting it is safe: boxes keep running and the next start reattaches to them.
+[Unit]
+Description=gpufleet GPU job scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/gpufleet
+Environment=PATH=/home/deploy/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/deploy/gpufleet/.venv/bin/fleet daemon
+Restart=always
+RestartSec=3
+MemoryMax=1G
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
