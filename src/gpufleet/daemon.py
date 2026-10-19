@@ -913,6 +913,15 @@ class Fleet:
             pending = self.pending_secs(jid)
             if booting and pending < 600 * booting:
                 continue  # the boxes already on their way are enough for what is queued
+            lanes = sum(len(b.lanes) for b in serving)
+            if lanes:
+                # Busy boxes will drain the queue: rent only if waiting for them takes longer than booting a new
+                # one would (a box that boots after the work is done is pure cost).
+                fastest = min((self._secs_per_unit(spec, b.gpu) / spec.unit_cost_s for b in serving), default=1)
+                drain_s = self._first_free_lane_s(serving) + pending * fastest / lanes
+                boot_s = min(self.store.boot_estimate(p, 240)[0] for p in self.providers) if self.providers else 240
+                if drain_s < 1.5 * boot_s:
+                    continue
             if await self._try_unpark(spec.need.profile, spec.need, spec):
                 self._notify(jid, ev="scaling", provider="parked", gpu="")
                 return
@@ -969,6 +978,26 @@ class Fleet:
         self.warm[profile] = {"boxes": boxes, "until": time.time() + minutes * 60, "need": n}
         self._wake.set()
         return {"profile": profile, "boxes": boxes, "until": self.warm[profile]["until"]}
+
+    def _first_free_lane_s(self, boxes: list[BoxRT]) -> float:
+        """Seconds until the first of these boxes' lanes is free. A task past its expected time is assumed to need
+        as long again (it is a straggler; the estimate grows while it runs)."""
+        now = time.time()
+        best = float("inf")
+        for b in boxes:
+            for l in b.lanes:
+                if l.task is None:
+                    return 0.0
+                r = self.store.one("SELECT * FROM tasks WHERE id=?", [l.task])
+                if not r:
+                    return 0.0
+                spec = self._spec(r["job_id"])
+                units = (r["hi"] - r["lo"] + 1) if r["lo"] is not None else 1
+                weight = float(spec.unit_costs.get(r["unit"], spec.unit_cost_s)) / spec.unit_cost_s if r["unit"] else 1
+                expect = self._secs_per_unit(spec, b.gpu) * units * weight
+                elapsed = now - (r["started_at"] or now)
+                best = min(best, expect - elapsed if elapsed < expect else elapsed)
+        return 0.0 if best == float("inf") else best
 
     async def _best_offer(self, spec: JobSpec, pending_ref_s: float) -> Offer | None:
         """Lowest expected cost of getting the queued work done on one new box of this offer:
