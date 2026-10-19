@@ -115,10 +115,16 @@ class JobSpec:
     max_chunk: int = 10_000
     inputs: tuple[Sync, ...] = ()
     outputs: tuple[Sync, ...] = ()  # pulled after each task; src is relative to the workspace
+    # Partial results of a running task (frames rendered so far), pulled every checkpoint_s while it runs. When the
+    # task is retried anywhere, they are pushed back first, so a resume-aware command skips finished work: a box
+    # that dies mid-shot costs at most checkpoint_s of rendering, not the whole shot.
+    checkpoint: tuple[Sync, ...] = ()
+    checkpoint_s: float = 120
     setup: str = ""  # runs once per box per distinct setup text (cached by hash)
     env: dict = dc.field(default_factory=dict)
     gpu_share: float = 1.0  # lanes per GPU = 1/gpu_share to start with; telemetry may raise it
-    timeout_factor: float = 3.0
+    timeout_factor: float = 3.0  # a task running longer than this x its expected time is killed and retried
+    timeout_min_s: float = 900  # ...but never before this (first runs on a new GPU have no good estimate)
     max_attempts: int = 3
     speculate: bool = True  # duplicate straggling tail tasks on idle faster boxes
     resume_safe: bool = False  # the command can be killed and rerun without corrupting outputs (enables spot)
@@ -130,10 +136,14 @@ class JobSpec:
         d = dict(d)
         d["need"] = Need.from_dict(d.get("need"))
         d["units"] = tuple(d.get("units", ()))
-        if d.get("range") is not None:
-            d["range_"] = tuple(d.pop("range"))
+        rng = d.pop("range", None)
+        if rng is not None:
+            d["range_"] = tuple(rng)
+        elif d.get("range_") is not None:
+            d["range_"] = tuple(d["range_"])
         d["inputs"] = tuple(Sync.parse(x) for x in d.get("inputs", ()))
         d["outputs"] = tuple(Sync.parse(x) for x in d.get("outputs", ()))
+        d["checkpoint"] = tuple(Sync.parse(x) for x in d.get("checkpoint", ()))
         names = {f.name for f in dc.fields(cls)}
         unknown = set(d) - names
         if unknown:

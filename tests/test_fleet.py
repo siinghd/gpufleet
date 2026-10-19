@@ -183,3 +183,85 @@ async def test_speculative_copy_finishes_a_straggler(tmp):
     assert fleet.store.one("SELECT 1 FROM events WHERE kind='speculate'")
     await fleet.shutdown(destroy=True)
     Path(f"/tmp/gf-spec-{jid}").unlink(missing_ok=True)
+
+
+def _kill_box(fleet: Fleet, prov: Fake, box_id: str) -> None:
+    """Simulate a box that stops answering: its processes die and SSH no longer connects."""
+    import os
+    import signal
+    b = fleet.boxes[box_id]
+    b.transport.alive = False
+    state = Path(b.transport.root).parent / "state"
+    for meta in state.glob("*/meta.json"):
+        try:
+            os.killpg(json.loads(meta.read_text())["pid"], signal.SIGKILL)
+        except OSError:
+            pass
+    b.proc.kill()
+
+
+async def test_box_dies_mid_task_and_retry_resumes_from_checkpoint(tmp):
+    prov = Fake(offers=[{"gpu_name": "RTX 4090", "price_h": 0.4, "machine_id": 1},
+                        {"gpu_name": "RTX 4090", "price_h": 0.5, "machine_id": 2}])
+    fleet = Fleet(make_cfg(tmp, max_boxes=2), {"fake": prov}, local_boxes=True)
+    renders = tmp / "renders.log"  # every frame actually rendered, on any box
+    # A resume-aware "render": 20 frames, skips frames already present, 0.15 s each.
+    cmd = (f'mkdir -p frames out; for f in $(seq 1 20); do [ -e frames/$f.png ] && continue; sleep 0.15; '
+           f'echo $f > frames/$f.png; echo $f >> {renders}; done; ls frames | wc -l > out/$GF_TASK.txt')
+    jid = fleet.submit(spec(tmp, units=["shot"], command=cmd, checkpoint_s=0.3,
+                            checkpoint=[{"src": "frames/", "dst": str(tmp / "ckpt") + "/"}]))
+    end = time.time() + 30
+    killed = None
+    while time.time() < end:
+        await fleet.tick()
+        done_frames = len(list((tmp / "ckpt").glob("*.png"))) if (tmp / "ckpt").exists() else 0
+        if killed is None and done_frames >= 6:
+            killed = fleet.store.one("SELECT box_id FROM tasks WHERE job_id=?", [jid])["box_id"]
+            _kill_box(fleet, prov, killed)
+        if fleet.job_status(jid)["status"] == "done":
+            break
+        await asyncio.sleep(0.1)
+    st = await run_until(fleet, jid, timeout=60)
+    assert killed and st["status"] == "done", st
+    assert (tmp / "results").glob("*.txt") and next((tmp / "results").glob("*.txt")).read_text().strip() == "20"
+    rendered = renders.read_text().split()
+    # Frames saved by the checkpoint were not rendered again (a few after the last checkpoint may be).
+    assert len(rendered) < 20 + 6, rendered
+    assert fleet.store.one("SELECT 1 FROM events WHERE kind='checkpoint_restored'")
+    await fleet.shutdown(destroy=True)
+    assert not prov.live
+
+
+async def test_daemon_restart_reattaches_and_collects_finished_work(tmp):
+    prov = Fake()
+    cfg = make_cfg(tmp, idle_s=60)
+    a = Fleet(cfg, {"fake": prov}, local_boxes=True)
+    jid = a.submit(spec(tmp, units=["u"], command="sleep 2; mkdir -p out; echo u > out/$GF_TASK.txt"))
+    end = time.time() + 20
+    while time.time() < end and not a.store.one("SELECT 1 FROM tasks WHERE status='running'"):
+        await a.tick()
+        await asyncio.sleep(0.1)
+    # Crash: the daemon disappears without destroying anything; the task keeps running on the box.
+    for b in a.boxes.values():
+        b.reader.cancel()
+        b.proc.kill()
+    a.store.db.close()
+    b = Fleet(cfg, {"fake": prov}, local_boxes=True)
+    await b.recover()
+    st = await run_until(b, jid, timeout=30)
+    assert st["status"] == "done", st
+    assert len(prov.launched) == 1  # reattached, not re-rented
+    assert b.store.one("SELECT 1 FROM events WHERE kind='box_recovered'")
+    await b.shutdown(destroy=True)
+
+
+async def test_hung_task_times_out_and_moves(tmp):
+    prov = Fake(offers=[{"gpu_name": "RTX 4090", "price_h": 0.4, "machine_id": 1},
+                        {"gpu_name": "RTX 4090", "price_h": 0.5, "machine_id": 2}])
+    fleet = Fleet(make_cfg(tmp, max_boxes=2), {"fake": prov}, local_boxes=True)
+    cmd = 'mkdir -p out; [ "$GF_ATTEMPT" = 1 ] && sleep 600; echo ok > out/$GF_TASK.txt'
+    jid = fleet.submit(spec(tmp, units=["u"], command=cmd, timeout_min_s=2, speculate=False))
+    st = await run_until(fleet, jid, timeout=40)
+    assert st["status"] == "done", st
+    assert fleet.store.one("SELECT 1 FROM events WHERE kind='task_timeout'")
+    await fleet.shutdown(destroy=True)

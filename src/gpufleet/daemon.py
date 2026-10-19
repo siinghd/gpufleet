@@ -76,6 +76,7 @@ class BoxRT:
     setups: set = field(default_factory=set)
     tel: list = field(default_factory=list)  # (t, util, mem, mem_total) from the agent
     full_since: float = 0.0
+    last_seen: float = field(default_factory=time.time)  # last event from the agent (telemetry every 5 s)
     lost: bool = False
 
     def free_lanes(self) -> list[int]:
@@ -102,6 +103,9 @@ class Fleet:
         self._last_accrue = time.time()
         self._stop = asyncio.Event()
         self._pulls = asyncio.Semaphore(int(cfg.get("max_parallel_pulls", 6)))
+        self._ckpt_at: dict[str, float] = {}  # task id -> last checkpoint pull
+        self._ckpt_busy: set[str] = set()
+        self.warm: dict[str, dict] = {}  # profile -> {"boxes": n, "until": t, "need": Need}
 
     # =========================================================================================== jobs and tasks
     def submit(self, spec: JobSpec) -> str:
@@ -253,9 +257,118 @@ class Fleet:
         self.store.update("tasks", task["id"], status="running", box_id=box.id, started_at=time.time(),
                           attempt=task["attempt"] + (0 if dup_of else 1))
         self.store.x("UPDATE jobs SET status='running' WHERE id=? AND status='queued'", [jid])
-        self._send(box, msg)
+        if spec.checkpoint:
+            asyncio.create_task(self._restore_then_run(box, spec, task, msg))
+        else:
+            self._send(box, msg)
         self._notify(jid, ev="started", task=task["id"], unit=task.get("unit"), lo=task.get("lo"),
                      hi=task.get("hi"), box=box.id, gpu=box.gpu)
+
+    async def _restore_then_run(self, box: BoxRT, spec: JobSpec, task: dict, msg: dict) -> None:
+        """Push the task's saved partial results (from an earlier attempt, on any box) back before it starts."""
+        for c in spec.checkpoint:
+            local = os.path.expanduser(self._subst(c.dst, task, spec))
+            if os.path.exists(local) and (not os.path.isdir(local) or any(os.scandir(local))):
+                src = local.rstrip("/") + ("/" if os.path.isdir(local) else "")
+                dst = f"{self._workspace(spec)}/{self._subst(c.src, task, spec)}"
+                try:
+                    await box.transport.push(Sync(src=src, dst=dst), timeout=1800)
+                    self.store.event("checkpoint_restored", task["id"], box=box.id, path=c.src)
+                except TransportError as e:
+                    log.warning("checkpoint restore for %s: %s", task["id"], e)
+        self._send(box, msg)
+
+    async def _pull_checkpoint(self, box: BoxRT, spec: JobSpec, task: dict, timeout: float = 600) -> bool:
+        if not spec.checkpoint or not box.transport:
+            return True
+        ok = True
+        for c in spec.checkpoint:
+            src = f"{self._workspace(spec)}/{self._subst(c.src, task, spec)}"
+            try:
+                await box.transport.pull(Sync(src=src, dst=self._subst(c.dst, task, spec), exclude=c.exclude),
+                                         timeout=timeout)
+            except TransportError as e:
+                ok = False
+                log.info("checkpoint pull %s: %s", task["id"], e)
+        self._ckpt_at[task["id"]] = time.time()
+        return ok
+
+    async def _pull_outputs(self, box: BoxRT, spec: JobSpec, task: dict) -> None:
+        """Outputs of a finished task, with retries: a link that drops for a minute must not cost the render."""
+        delays = [5, 15, 40]
+        for attempt in range(len(delays) + 1):
+            try:
+                async with self._pulls:
+                    await asyncio.gather(*(box.transport.pull(Sync(
+                        src=f"{self._workspace(spec)}/{self._subst(s.src, task, spec)}",
+                        dst=self._subst(s.dst, task, spec), exclude=s.exclude)) for s in spec.outputs))
+                return
+            except TransportError:
+                if attempt == len(delays):
+                    raise
+                await asyncio.sleep(delays[attempt])
+                if isinstance(box.transport, SshTransport) and not box.transport.alive:
+                    await box.transport.open(timeout=60)
+
+    def checkpoints(self) -> None:
+        now = time.time()
+        for r in self.store.q("SELECT * FROM tasks WHERE status='running'"):
+            tid = r["id"]
+            if tid in self._ckpt_busy:
+                continue
+            spec = self._spec(r["job_id"])
+            box = self.boxes.get(r["box_id"] or "")
+            if not spec.checkpoint or not box or box.status not in ("ready", "draining"):
+                continue
+            if now - max(self._ckpt_at.get(tid, 0), r["started_at"] or now) < spec.checkpoint_s:
+                continue
+            self._ckpt_busy.add(tid)
+
+            async def go(b=box, sp=spec, t=dict(r)):
+                try:
+                    await self._pull_checkpoint(b, sp, t)
+                finally:
+                    self._ckpt_busy.discard(t["id"])
+
+            asyncio.create_task(go())
+
+    def watchdogs(self) -> None:
+        """Heartbeats and task timeouts."""
+        now = time.time()
+        for b in self.boxes.values():
+            if b.status in ("ready", "draining") and b.proc and b.proc.returncode is None \
+                    and now - b.last_seen > float(self.cfg.get("heartbeat_s", 45)):
+                # The agent sends telemetry every 5 s. Silence means the link (or box) hung: kill the channel; the
+                # reader's exit path reconnects or, failing that, requeues and destroys.
+                log.warning("box %s silent for %.0fs", b.id, now - b.last_seen)
+                self.store.event("heartbeat_lost", b.id, silent_s=round(now - b.last_seen))
+                b.last_seen = now
+                b.proc.kill()
+        for r in self.store.q("SELECT * FROM tasks WHERE status='running' AND started_at IS NOT NULL"):
+            spec = self._spec(r["job_id"])
+            box = self.boxes.get(r["box_id"] or "")
+            if not box:
+                continue
+            units = (r["hi"] - r["lo"] + 1) if r["lo"] is not None else 1
+            weight = (float(spec.unit_costs.get(r["unit"], spec.unit_cost_s)) / spec.unit_cost_s) if r["unit"] else 1
+            expect = self._secs_per_unit(spec, box.gpu) * units * weight
+            limit = max(spec.timeout_min_s, spec.timeout_factor * expect)
+            if now - r["started_at"] > limit:
+                log.warning("task %s over its %.0fs limit on %s", r["id"], limit, box.id)
+                self.store.event("task_timeout", r["id"], box=box.id, limit=round(limit))
+                self._send(box, {"op": "cancel", "task": r["id"]})
+                for l in box.lanes:
+                    if l.task == r["id"]:
+                        l.task = None
+                excl = json.loads(r["excluded"]) + [box.id]
+                if r["dup_of"] or r["attempt"] >= spec.max_attempts:
+                    self.store.update("tasks", r["id"], status="failed", rc=124, finished_at=now,
+                                      tail=f"timed out after {limit:.0f}s")
+                else:
+                    self.store.update("tasks", r["id"], status="queued", box_id=None, rc=124,
+                                      excluded=json.dumps(excl))
+                self._notify(r["job_id"], ev="timeout", task=r["id"], limit=round(limit), box=box.id)
+                self._finish_jobs()
 
     def _send(self, box: BoxRT, msg: dict) -> None:
         if box.proc and box.proc.stdin and not box.proc.stdin.is_closing():
@@ -355,6 +468,7 @@ class Fleet:
 
     async def _on_event(self, box: BoxRT, ev: dict) -> None:
         kind = ev.get("ev")
+        box.last_seen = time.time()
         if kind == "tel":
             gpus = ev.get("gpus") or []
             if gpus:
@@ -387,10 +501,7 @@ class Fleet:
         if rc == 0:
             self.store.update("tasks", tid, status="pulling", rc=0, tail=ev.get("tail", "")[-4000:])
             try:
-                async with self._pulls:
-                    await asyncio.gather(*(box.transport.pull(Sync(
-                        src=f"{self._workspace(spec)}/{self._subst(s.src, task, spec)}",
-                        dst=self._subst(s.dst, task, spec), exclude=s.exclude)) for s in spec.outputs))
+                await self._pull_outputs(box, spec, task)
             except TransportError as e:
                 # The task finished but its outputs did not come back: treat the box as faulty. It drains, and
                 # destroying it requeues the task elsewhere (a rerun is cheaper than trusting a flaky link).
@@ -426,6 +537,8 @@ class Fleet:
             self._notify(jid, ev="done", task=tid, unit=r["unit"], lo=r["lo"], hi=r["hi"], secs=secs, box=box.id)
         else:
             lost = bool(ev.get("lost"))
+            if rc not in (-15, 143) and spec.checkpoint:
+                await self._pull_checkpoint(box, spec, task, timeout=300)  # keep what it finished before failing
             self._send(box, {"op": "ack", "task": tid})
             excluded = json.loads(r["excluded"])
             machine_fault = rc in MACHINE_FAULT_RCS or lost
@@ -571,7 +684,7 @@ class Fleet:
     async def _connect(self, box: BoxRT, target: SshTarget, prov: Provider, fresh: bool) -> None:
         """Open the transport, bootstrap (fresh boxes), restore caches, start the agent channel."""
         if self.local_boxes:
-            box.transport = box.transport or LocalTransport(box.id)
+            box.transport = box.transport or LocalTransport(box.id, self.state_dir / "local-boxes" / box.id)
         else:
             box.transport = SshTransport(box.id, target, self.state_dir, prov.ssh_options())
         await box.transport.open(timeout=240)
@@ -599,8 +712,23 @@ class Fleet:
         box.proc = await box.transport.spawn(
             f"python3 {agent_path} serve --root {box.transport.root} --state {state}")
         hello = await asyncio.wait_for(box.proc.stdout.readline(), 60)
-        if not hello or json.loads(hello).get("ev") != "hello":
+        h = json.loads(hello) if hello else {}
+        if h.get("ev") != "hello":
             raise TransportError(f"agent did not start: {hello[:200]!r}", 1)
+        known = set(h.get("known") or [])
+        if not fresh:
+            # Tasks the database believes run here but the agent has never heard of (lost before they started,
+            # e.g. the daemon died between lease and send): requeue them.
+            for r in self.store.q("SELECT id, job_id FROM tasks WHERE box_id=? AND status IN ('running','pulling')",
+                                  [box.id]):
+                if r["id"] not in known:
+                    self.store.update("tasks", r["id"], status="queued", box_id=None)
+                    self._notify(r["job_id"], ev="requeued", task=r["id"], why="unknown to agent after reconnect")
+            busy = [t for t in h.get("running") or [] if t in known]
+            for i, t in enumerate(busy):
+                if i < len(box.lanes):
+                    box.lanes[i] = Lane(task=t, since=time.time())
+        box.last_seen = time.time()
         box.reader = asyncio.create_task(self._read_agent(box))
 
     def _min_share(self, box: BoxRT) -> float:
@@ -667,6 +795,13 @@ class Fleet:
         box.status = "destroying"
         self.store.update("boxes", box.id, status="destroying", note=why[:300])
         if prev in ("ready", "draining") and not box.lost:
+            for r in self.store.q("SELECT * FROM tasks WHERE box_id=? AND status='running'", [box.id]):
+                spec = self._spec(r["job_id"])
+                if spec.checkpoint:
+                    try:
+                        await asyncio.wait_for(self._pull_checkpoint(box, spec, dict(r), timeout=240), 260)
+                    except Exception:
+                        pass
             try:
                 await asyncio.wait_for(self._save_caches(box), 120)
             except Exception:
@@ -952,8 +1087,10 @@ class Fleet:
 
     async def tick(self) -> None:
         self.accrue()
+        self.watchdogs()
         self.dispatch()
         self.speculate()
+        self.checkpoints()
         self.lanes()
         await self.scale()
         await self.lifecycle()

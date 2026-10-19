@@ -214,8 +214,9 @@ class Agent:
 
     def loop(self):
         self.tel.start()
-        emit(ev="hello", pid=os.getpid(), root=self.root, py=sys.version.split()[0],
-             running=[t for t in os.listdir(self.state) if not os.path.exists(os.path.join(self.tdir(t), "rc"))])
+        known = os.listdir(self.state)
+        emit(ev="hello", pid=os.getpid(), root=self.root, py=sys.version.split()[0], known=known,
+             running=[t for t in known if not os.path.exists(os.path.join(self.tdir(t), "rc"))])
 
         def reader():
             for line in sys.stdin:
