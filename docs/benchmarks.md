@@ -28,7 +28,7 @@ Columns: steady-state median seconds per frame (frames 2..48), first frame (kern
   NVIDIA vendor; then EEVEE runs at 0.18 s/frame.
 - NVENC works (h264, 48 frames in 1.07 s). Downloads from download.blender.org: 203 MB/s; Blender extracts in 13 s and
   starts in 1.4 s.
-- Network through the Colab SSH tunnel (one multiplexed connection): rsync 5.7 MB/s up, 10.9 MB/s down from Helsinki.
+- Network through the Colab SSH tunnel (one multiplexed connection): rsync 5.7 MB/s up, 10.9 MB/s down.
 - Allocation: G4 returned 503 (no capacity) once, then 412 (too many assignments, a leftover of the failed attempt)
   twice, then succeeded; ~3 minutes in total. SSH answered 2.4 s after assignment.
 
