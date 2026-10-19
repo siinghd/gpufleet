@@ -144,6 +144,11 @@ class Vast(Provider):
         # Belt and braces with the daemon's own watchdog: the box deletes itself at its hard deadline using the
         # per-container key Vast injects (it can only stop/destroy this one instance).
         onstart = (
+            # sshd refuses keys when /root/.ssh has the wrong owner or modes ("bad ownership or modes for file
+            # /root/.ssh/authorized_keys" on some hosts/images): keep repairing it while Vast installs the key.
+            "(for i in $(seq 60); do chown root:root /root /root/.ssh /root/.ssh/authorized_keys 2>/dev/null; "
+            "chmod go-w /root; chmod 700 /root/.ssh; chmod 600 /root/.ssh/authorized_keys 2>/dev/null; sleep 2; "
+            "done) >/dev/null 2>&1 & "
             "env | grep -E '^(CONTAINER_|VAST_|GF_|NVIDIA_)' >> /etc/environment; "
             f"nohup sh -c 'sleep {int(ttl_s)}; curl -fsS -X DELETE -H \"Authorization: Bearer $CONTAINER_API_KEY\" "
             f"{API}/instances/$CONTAINER_ID/' >/dev/null 2>&1 &"
@@ -163,12 +168,14 @@ class Vast(Provider):
         ext = r.get("new_contract")
         if not ext:
             raise ProviderError(f"create returned no contract: {r}")
-        if os.path.exists(self.ssh_key + ".pub"):
+        if self.cfg.get("attach_key"):
+            # Only for a key that is not the account's own (Vast installs account keys itself; attaching the same
+            # key again was followed by sshd refusing authorized_keys on every box, 19 Oct 2026).
             try:
                 await self._req("POST", f"{API}/instances/{ext}/ssh/",
                                 json={"ssh_key": Path(self.ssh_key + ".pub").read_text().strip()})
             except ProviderError:
-                pass  # the account key is attached anyway; this only helps when the account key differs
+                pass
         return str(ext)
 
     async def _show(self, ext_id: str) -> dict | None:

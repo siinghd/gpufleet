@@ -308,3 +308,16 @@ async def test_warm_pool_keeps_a_ready_box(tmp):
     assert (await run_until(fleet, j))["status"] == "done"
     assert time.time() - t0 < 3 and len(prov.launched) == 1
     await fleet.shutdown(destroy=True)
+
+
+async def test_stuck_destroying_box_is_retried_by_reconciler(tmp):
+    from gpufleet.models import RemoteBox
+    prov = Fake()
+    fleet = Fleet(make_cfg(tmp), {"fake": prov}, local_boxes=True)
+    now = time.time()
+    prov.live["77"] = RemoteBox(ext_id="77", label="gf-bstuck", status="running")
+    fleet.store.x("INSERT INTO boxes (id, provider, ext_id, label, status, created_at, hard_deadline) "
+                  "VALUES ('bstuck','fake','77','gf-bstuck','destroying',?,?)", [now, now + 3600])
+    await fleet.reconcile()
+    assert "77" not in prov.live
+    assert fleet.store.one("SELECT status FROM boxes WHERE id='bstuck'")["status"] == "destroyed"

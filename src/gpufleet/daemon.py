@@ -808,8 +808,9 @@ class Fleet:
     def _cache_key(self, box: BoxRT) -> str:
         return f"{box.profile}--{perf.canonical(box.gpu).replace(' ', '_')}--{box.driver}"
 
-    async def _destroy(self, box: BoxRT, why: str) -> None:
-        if box.status in ("destroying", "destroyed"):
+    async def _destroy(self, box: BoxRT, why: str, retry: bool = False) -> None:
+        """Release a box. `retry` re-attempts one already marked destroying (after a crash or a failed destroy)."""
+        if box.status == "destroyed" or (box.status == "destroying" and not retry):
             return
         prev = box.status
         box.status = "destroying"
@@ -1154,6 +1155,13 @@ class Fleet:
                     continue
                 seen.add(rb.ext_id)
                 row = known.get(rb.ext_id)
+                if row is not None and row["status"] == "destroying":
+                    box = self.boxes.get(row["id"]) or BoxRT(id=row["id"], provider=name, ext_id=rb.ext_id,
+                                                             status="destroying")
+                    self.boxes[box.id] = box
+                    await self._destroy(box, "reconcile: destroy retry", retry=True)
+                    report["retried"].append(rb.ext_id)
+                    continue
                 if row is None or rb.terminal or time.time() > (row["hard_deadline"] if row else 0):
                     if row is not None and row["id"] in self.boxes:
                         await self._destroy(self.boxes[row["id"]], "reconcile: terminal or past deadline")
@@ -1217,7 +1225,7 @@ class Fleet:
                 box = BoxRT(id=row["id"], provider=row["provider"], ext_id=row["ext_id"] or "",
                             status=row["status"])
                 self.boxes[box.id] = box
-                await self._destroy(box, "daemon restarted mid-launch")
+                await self._destroy(box, "daemon restarted mid-launch", retry=row["status"] == "destroying")
         for r in self.store.q("SELECT id FROM tasks WHERE status IN ('running','pulling') AND (box_id IS NULL OR "
                               "box_id NOT IN (SELECT id FROM boxes WHERE status IN ('ready','draining')))"):
             self.store.update("tasks", r["id"], status="queued", box_id=None)
@@ -1258,8 +1266,9 @@ class Fleet:
     async def shutdown(self, destroy: bool = False) -> None:
         self._stop.set()
         for b in list(self.boxes.values()):
-            if destroy:
-                await self._destroy(b, "shutdown")
+            if destroy or b.status in ("requested", "booting", "unparking", "destroying"):
+                # A box still booting cannot be reattached by the next start; release it now.
+                await self._destroy(b, "shutdown", retry=b.status == "destroying")
             elif b.transport and isinstance(b.transport, SshTransport):
                 await b.transport.close()  # boxes keep running; the next daemon start reattaches
         for p in self.providers.values():
