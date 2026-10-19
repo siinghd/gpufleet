@@ -102,6 +102,7 @@ class Fleet:
         self._last_reconcile = 0.0
         self._last_accrue = time.time()
         self._stop = asyncio.Event()
+        self._wake = asyncio.Event()  # set on submit / task exit / box ready: dispatch now, not at the next tick
         self._pulls = asyncio.Semaphore(int(cfg.get("max_parallel_pulls", 6)))
         self._ckpt_at: dict[str, float] = {}  # task id -> last checkpoint pull
         self._ckpt_busy: set[str] = set()
@@ -121,6 +122,7 @@ class Fleet:
                 self.store.x("INSERT INTO tasks (id, job_id, unit, status, est_s) VALUES (?,?,?,?,?)",
                              [_id("t"), jid, u, "queued", float(spec.unit_costs.get(u, spec.unit_cost_s))])
         self.jobs[jid] = spec
+        self._wake.set()
         self.store.event("job_submitted", jid, project=spec.project, name=spec.name)
         self._notify(jid, ev="submitted")
         return jid
@@ -485,6 +487,7 @@ class Fleet:
 
     async def _on_exit(self, box: BoxRT, ev: dict) -> None:
         tid = ev["task"]
+        self._wake.set()
         r = self.store.one("SELECT * FROM tasks WHERE id=?", [tid])
         for l in box.lanes:
             if l.task == tid:
@@ -655,6 +658,7 @@ class Fleet:
                 self.store.update("boxes", bid, status="ready", ready_at=box.ready_at, gpu_name=box.gpu)
                 self.store.x("INSERT INTO boot_stats VALUES (?,?,?,1)", [o.provider, time.time(), time.time() - t0])
                 self.store.event("box_ready", bid, secs=round(time.time() - t0, 1), gpu=box.gpu, driver=box.driver)
+                self._wake.set()
                 return
             except (ProviderError, TransportError, OSError) as e:
                 log.warning("launch %s (%s %s) failed: %s", bid, o.provider, o.gpu_name, e)
@@ -681,7 +685,8 @@ class Fleet:
         offers = [o for o in offers if (o.machine_id or o.offer_id) not in tried]
         return min(offers, key=lambda o: o.price_h) if offers else None
 
-    async def _connect(self, box: BoxRT, target: SshTarget, prov: Provider, fresh: bool) -> None:
+    async def _connect(self, box: BoxRT, target: SshTarget, prov: Provider, fresh: bool,
+                       restore: bool = False) -> None:
         """Open the transport, bootstrap (fresh boxes), restore caches, start the agent channel."""
         if self.local_boxes:
             box.transport = box.transport or LocalTransport(box.id, self.state_dir / "local-boxes" / box.id)
@@ -861,9 +866,22 @@ class Fleet:
         return free, booting
 
     async def scale(self) -> None:
-        alive = [b for b in self.boxes.values() if b.status not in ("destroying", "destroyed")]
+        alive = [b for b in self.boxes.values() if b.status not in ("destroying", "destroyed", "parked")]
         if len(alive) >= int(self.cfg["max_boxes"]) or self.launching:
             return
+        # Warm pool: keep N ready boxes of a profile for a while (seconds-latency for the next job).
+        for prof, w in list(self.warm.items()):
+            want = self._warm_need(prof)
+            have = sum(1 for b in alive if b.profile == prof and b.status in ("requested", "booting", "ready",
+                                                                             "unparking"))
+            if have < want:
+                if await self._try_unpark(prof, w["need"]):
+                    return
+                best = await self._best_offer(JobSpec(project="warm", name=prof, command="", units=("x",),
+                                                      need=w["need"]), 600)
+                if best and (await self._budget_ok(best))[0]:
+                    await self._spawn_launch(best, w["need"])
+                    return
         for jid in self.active_jobs():
             spec = self._spec(jid)
             if not self.has_queued(jid):
@@ -878,6 +896,9 @@ class Fleet:
             pending = self.pending_secs(jid)
             if booting and pending < 600 * booting:
                 continue  # the boxes already on their way are enough for what is queued
+            if await self._try_unpark(spec.need.profile, spec.need, spec):
+                self._notify(jid, ev="scaling", provider="parked", gpu="")
+                return
             if self.store.one("SELECT cost FROM jobs WHERE id=?", [jid])["cost"] >= spec.budget_usd:
                 self._notify(jid, ev="budget_reached", budget=spec.budget_usd)
                 continue
@@ -889,18 +910,48 @@ class Fleet:
                 self._notify(jid, ev="blocked", why=why)
                 self.store.event("scale_blocked", jid, why=why)
                 continue
-            key = f"{best.provider}:{best.offer_id}"
+            await self._spawn_launch(best, spec.need)
+            self._notify(jid, ev="scaling", provider=best.provider, gpu=best.gpu_name, price_h=round(best.price_h, 3))
+            return  # one launch per tick; the next tick sees the new box as booting capacity
+
+    async def _spawn_launch(self, offer: Offer, need: Need) -> None:
+        key = f"{offer.provider}:{offer.offer_id}"
+        self.launching.add(key)
+
+        async def go():
+            try:
+                await self._launch(offer, need)
+            finally:
+                self.launching.discard(key)
+
+        asyncio.create_task(go())
+
+    async def _try_unpark(self, profile: str, need: Need, spec: JobSpec | None = None) -> bool:
+        for b in self.boxes.values():
+            if b.status != "parked" or b.profile != profile:
+                continue
+            if need.providers and b.provider not in need.providers:
+                continue
+            if spec is not None and not self._fits(spec, b):
+                continue
+            key = f"unpark:{b.id}"
             self.launching.add(key)
 
-            async def go(o=best, need=spec.need, k=key):
+            async def go(box=b, k=key):
                 try:
-                    await self._launch(o, need)
+                    await self._unpark(box)
                 finally:
                     self.launching.discard(k)
 
             asyncio.create_task(go())
-            self._notify(jid, ev="scaling", provider=best.provider, gpu=best.gpu_name, price_h=round(best.price_h, 3))
-            return  # one launch per tick; the next tick sees the new box as booting capacity
+            return True
+        return False
+
+    def set_warm(self, profile: str, boxes: int, minutes: float, need: dict | None = None) -> dict:
+        n = Need.from_dict({**(need or {}), "profile": profile})
+        self.warm[profile] = {"boxes": boxes, "until": time.time() + minutes * 60, "need": n}
+        self._wake.set()
+        return {"profile": profile, "boxes": boxes, "until": self.warm[profile]["until"]}
 
     async def _best_offer(self, spec: JobSpec, pending_ref_s: float) -> Offer | None:
         """Lowest expected cost of getting the queued work done on one new box of this offer:
@@ -925,12 +976,17 @@ class Fleet:
                 log.warning("offers from %s: %s", name, e)
                 continue
             boot_med, rate = self.store.boot_estimate(name, 240)
+            good = {r["machine_id"] for r in self.store.q(
+                "SELECT DISTINCT machine_id FROM machines WHERE provider=? AND kind='ok' AND at>?",
+                [name, time.time() - 14 * 86400])}
             for o in offers:
                 if o.price_h > spec.need.max_price_h:
                     continue
+                if o.machine_id in good:
+                    o = Offer(**{**o.__dict__, "boot_s": min(boot_med, 75)})  # image layers likely cached there
                 spu = self._secs_per_unit(spec, o.gpu_name) / spec.unit_cost_s  # box-seconds per reference-second
                 work = min(pending_ref_s * spu, 3600)
-                boot = o.boot_s if o.prepaid else boot_med
+                boot = o.boot_s if (o.prepaid or o.machine_id in good) else boot_med
                 hours = (boot + work) / 3600
                 cost = o.price_h * hours / max(rate, 0.3) + vot * hours
                 cands.append((cost, o))
@@ -965,13 +1021,72 @@ class Fleet:
                 b.full_since = 0
                 self.store.event("lane_added", b.id, lanes=len(b.lanes), util=round(util), mem=mem, total=tot)
 
+    def _warm_need(self, profile: str) -> int:
+        w = self.warm.get(profile)
+        if not w or time.time() > w["until"]:
+            self.warm.pop(profile, None)
+            return 0
+        return int(w["boxes"])
+
+    async def _park(self, b: BoxRT) -> bool:
+        """Idle box -> stopped box that keeps its disk (image, inputs, caches) and restarts in seconds."""
+        prov = self.providers[b.provider]
+        parked = sum(1 for x in self.boxes.values() if x.status == "parked")
+        if (not prov.supports_park or b.spot or parked >= int(self.cfg.get("park_max", 2))
+                or time.time() - b.created > float(self.cfg["reuse_max_age_s"]) * 0.75):
+            return False
+        try:
+            await asyncio.wait_for(self._save_caches(b), 120)
+        except Exception:
+            pass
+        if b.proc and b.proc.returncode is None:
+            b.proc.kill()
+        if b.reader:
+            b.reader.cancel()
+        if b.transport:
+            await b.transport.close()
+        try:
+            await prov.park(b.ext_id)
+        except ProviderError as e:
+            log.info("park %s failed: %s", b.id, e)
+            return False
+        b.status = "parked"
+        b.lanes = []
+        self.store.update("boxes", b.id, status="parked", note="parked idle",
+                          hard_deadline=time.time() + float(self.cfg.get("park_ttl_s", 86400)))
+        self.store.event("box_parked", b.id)
+        return True
+
+    async def _unpark(self, b: BoxRT) -> None:
+        prov = self.providers[b.provider]
+        b.status = "unparking"
+        self.store.update("boxes", b.id, status="unparking")
+        t0 = time.time()
+        try:
+            target = await prov.unpark(b.ext_id, t0 + float(self.cfg.get("unpark_timeout_s", 120)))
+            self.store.update("boxes", b.id, ssh=json.dumps(target.__dict__))
+            b.transport = None if not self.local_boxes else b.transport
+            await self._connect(b, target, prov, fresh=False, restore=True)
+            b.status = "ready"
+            b.created = time.time()  # age counts from the restart: the contract and host are what they were
+            b.idle_since = time.time()
+            self.store.update("boxes", b.id, status="ready", hard_deadline=time.time() + float(self.cfg["hard_ttl_s"]))
+            self.store.event("box_unparked", b.id, secs=round(time.time() - t0, 1))
+            self._wake.set()
+        except Exception as e:
+            log.info("unpark %s failed: %s", b.id, e)
+            self.store.event("unpark_failed", b.id, error=str(e)[-300:])
+            b.lost = True
+            await self._destroy(b, "unpark failed")
+
     async def lifecycle(self) -> None:
         now = time.time()
         queued_any = any(self.has_queued(j) for j in self.active_jobs())
         for b in list(self.boxes.values()):
             row = self.store.one("SELECT hard_deadline FROM boxes WHERE id=?", [b.id])
             if row and now > row["hard_deadline"]:
-                await self._destroy(b, "hard deadline")
+                b.lost = b.lost or b.status == "parked"
+                await self._destroy(b, "hard deadline" if b.status != "parked" else "parked too long")
                 continue
             if b.status == "ready" and now - b.created > float(self.cfg["reuse_max_age_s"]):
                 b.status = "draining"
@@ -982,15 +1097,22 @@ class Fleet:
             if b.status == "ready" and not b.busy():
                 usable = queued_any and any(self._fits(self._spec(j), b) and self.has_queued(j)
                                             for j in self.active_jobs())
-                if not usable and now - b.idle_since > float(self.cfg["idle_s"]):
-                    await self._destroy(b, "idle")
+                ready_same = sum(1 for x in self.boxes.values() if x.profile == b.profile and x.status == "ready")
+                if usable or ready_same <= self._warm_need(b.profile):
+                    continue
+                if now - b.idle_since > float(self.cfg["idle_s"]):
+                    if not await self._park(b):
+                        await self._destroy(b, "idle")
 
     def accrue(self) -> None:
         now = time.time()
         dt = now - self._last_accrue
         self._last_accrue = now
         for b in self.boxes.values():
-            if b.status in ("booting", "ready", "draining", "destroying") and b.ext_id:
+            if b.status == "parked":
+                self.store.add_spend(b.provider, 0.012 * dt / 3600)
+                continue
+            if b.status in ("booting", "ready", "draining", "destroying", "unparking") and b.ext_id:
                 if b.prepaid:
                     self.store.add_spend(b.provider, 0, b.units_h * dt / 3600)
                 else:
@@ -1053,6 +1175,13 @@ class Fleet:
             prov = self.providers.get(row["provider"])
             if prov is None:
                 continue
+            if row["status"] == "parked":
+                box = BoxRT(id=row["id"], provider=row["provider"], ext_id=row["ext_id"] or "",
+                            gpu=row["gpu_name"] or "", num_gpus=row["num_gpus"] or 1, price_h=row["price_h"] or 0,
+                            machine_id=row["machine_id"] or "", host_id=row["host_id"] or "", status="parked",
+                            created=row["created_at"], profile=row["profile"] or "base")
+                self.boxes[box.id] = box
+                continue
             if row["status"] in ("ready", "draining") and row["ssh"]:
                 box = BoxRT(id=row["id"], provider=row["provider"], ext_id=row["ext_id"] or "",
                             gpu=row["gpu_name"] or "", num_gpus=row["num_gpus"] or 1, price_h=row["price_h"] or 0,
@@ -1105,9 +1234,10 @@ class Fleet:
             except Exception:
                 log.exception("tick failed")
             try:
-                await asyncio.wait_for(self._stop.wait(), 1.0)
+                await asyncio.wait_for(self._wake.wait(), 1.0)
             except asyncio.TimeoutError:
                 pass
+            self._wake.clear()
 
     async def shutdown(self, destroy: bool = False) -> None:
         self._stop.set()

@@ -51,6 +51,16 @@ class Provider(abc.ABC):
         """Account-level guard checked before every launch (credit floors, unit floors)."""
         return True, ""
 
+    supports_park: bool = False
+
+    async def park(self, ext_id: str) -> None:
+        """Stop the box but keep its disk (only storage is billed). Optional."""
+        raise ProviderError("park not supported", retry_other=False)
+
+    async def unpark(self, ext_id: str, deadline: float) -> SshTarget:
+        """Start a parked box again and wait for SSH. Raise if it cannot get its GPU back by the deadline."""
+        raise ProviderError("unpark not supported", retry_other=False)
+
     def ssh_options(self) -> list[str]:
         """Extra ssh -o options for this provider's boxes."""
         return []

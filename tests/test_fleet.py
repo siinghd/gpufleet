@@ -17,7 +17,7 @@ from gpufleet.store import Store
 def make_cfg(tmp: Path, **over) -> dict:
     cfg = config._merge(config.DEFAULTS, {
         "db": str(tmp / "fleet.db"), "scale_delay_s": 0, "idle_s": 1, "reconcile_s": 3600, "boot_retries": 3,
-        "lane_autoscale": False, **over})
+        "lane_autoscale": False, "park_max": 0, **over})
     cfg["state_dir"] = str(tmp / "state")
     return cfg
 
@@ -264,4 +264,47 @@ async def test_hung_task_times_out_and_moves(tmp):
     st = await run_until(fleet, jid, timeout=40)
     assert st["status"] == "done", st
     assert fleet.store.one("SELECT 1 FROM events WHERE kind='task_timeout'")
+    await fleet.shutdown(destroy=True)
+
+
+async def test_idle_box_is_parked_and_restarted_for_the_next_job(tmp):
+    prov = Fake()
+    fleet = Fleet(make_cfg(tmp, park_max=2), {"fake": prov}, local_boxes=True)
+    j1 = fleet.submit(spec(tmp, units=["a"]))
+    assert (await run_until(fleet, j1))["status"] == "done"
+    await settle(fleet, 2.5)  # idle_s=1 -> parked, not destroyed
+    assert [b.status for b in fleet.boxes.values()] == ["parked"]
+    t0 = time.time()
+    j2 = fleet.submit(spec(tmp, units=["b"]))
+    assert (await run_until(fleet, j2))["status"] == "done"
+    assert len(prov.launched) == 1 and prov.unparked == 1  # reused the parked box, no new rental
+    assert time.time() - t0 < 10
+    await fleet.shutdown(destroy=True)
+    assert not prov.live
+
+
+async def test_failed_unpark_falls_back_to_a_new_box(tmp):
+    prov = Fake()
+    fleet = Fleet(make_cfg(tmp, park_max=2), {"fake": prov}, local_boxes=True)
+    j1 = fleet.submit(spec(tmp, units=["a"]))
+    await run_until(fleet, j1)
+    await settle(fleet, 2.5)
+    prov.fail_unpark = True
+    j2 = fleet.submit(spec(tmp, units=["b"]))
+    assert (await run_until(fleet, j2))["status"] == "done"
+    assert len(prov.launched) == 2 and fleet.store.one("SELECT 1 FROM events WHERE kind='unpark_failed'")
+    await fleet.shutdown(destroy=True)
+    assert not prov.live
+
+
+async def test_warm_pool_keeps_a_ready_box(tmp):
+    prov = Fake()
+    fleet = Fleet(make_cfg(tmp), {"fake": prov}, local_boxes=True)
+    fleet.set_warm("base", 1, 1)
+    await settle(fleet, 2.5)  # idle_s=1, but the warm target keeps it
+    assert [b.status for b in fleet.boxes.values()] == ["ready"]
+    t0 = time.time()
+    j = fleet.submit(spec(tmp, units=["a"]))
+    assert (await run_until(fleet, j))["status"] == "done"
+    assert time.time() - t0 < 3 and len(prov.launched) == 1
     await fleet.shutdown(destroy=True)

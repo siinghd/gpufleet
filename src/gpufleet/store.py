@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS boxes (
   provider TEXT NOT NULL,
   ext_id TEXT,                    -- provider instance id / session name
   label TEXT NOT NULL,
-  status TEXT NOT NULL,           -- requested, booting, ready, draining, destroying, destroyed, failed
+  status TEXT NOT NULL,           -- requested, booting, ready, draining, parked, unparking, destroying, destroyed
   offer TEXT,                     -- JSON of the offer it was rented from
   profile TEXT,
   gpu_name TEXT, num_gpus INTEGER, price_h REAL, prepaid INTEGER DEFAULT 0, spot INTEGER DEFAULT 0,
@@ -78,7 +78,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 """
 
-ALIVE = ("requested", "booting", "ready", "draining", "destroying")
+ALIVE = ("requested", "booting", "ready", "draining", "destroying", "parked", "unparking")
 
 
 class Store:

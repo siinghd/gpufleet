@@ -56,6 +56,20 @@ class Fake(Provider):
             raise ProviderError("gone")
         return SshTarget(host="localhost")
 
+    supports_park = True
+
+    async def park(self, ext_id: str) -> None:
+        b = self.live[ext_id]
+        self.live[ext_id] = RemoteBox(ext_id=ext_id, label=b.label, status="stopped", created_at=b.created_at)
+
+    async def unpark(self, ext_id: str, deadline: float) -> SshTarget:
+        b = self.live.get(ext_id)
+        if b is None or getattr(self, "fail_unpark", False):
+            raise ProviderError("gpu taken", machine_fault=False)
+        self.live[ext_id] = RemoteBox(ext_id=ext_id, label=b.label, status="running", created_at=b.created_at)
+        self.unparked = getattr(self, "unparked", 0) + 1
+        return SshTarget(host="localhost")
+
     async def destroy(self, ext_id: str) -> None:
         if self.live.pop(ext_id, None) is not None:
             self.destroyed.append(ext_id)

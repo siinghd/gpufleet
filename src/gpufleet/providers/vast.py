@@ -37,6 +37,7 @@ def _key() -> str:
 
 class Vast(Provider):
     name = "vast"
+    supports_park = True
 
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -177,15 +178,16 @@ class Vast(Provider):
         inst = d.get("instances")
         return inst if isinstance(inst, dict) and inst else None
 
-    async def wait_ready(self, ext_id: str, deadline: float) -> SshTarget:
+    async def wait_ready(self, ext_id: str, deadline: float, grace_s: float = 0) -> SshTarget:
         last = ""
+        started = time.time()
         while time.time() < deadline:
             inst = await self._show(ext_id)
             if inst is None:
                 raise ProviderError(f"instance {ext_id} vanished while booting", machine_fault=True)
             st = inst.get("actual_status") or ""
             last = f"{st} {inst.get('status_msg') or ''}".strip()
-            if st in TERMINAL:
+            if st in TERMINAL and time.time() - started > grace_s:
                 raise ProviderError(f"instance {ext_id} went {st}: {inst.get('status_msg')}", machine_fault=True)
             if st == "running":
                 port = None
@@ -200,6 +202,15 @@ class Vast(Provider):
                     return SshTarget(host=inst["ssh_host"], port=int(inst["ssh_port"]))
             await asyncio.sleep(4)
         raise ProviderError(f"instance {ext_id} not ready by deadline (last: {last})", machine_fault=True)
+
+    async def park(self, ext_id: str) -> None:
+        await self._req("PUT", f"{API}/instances/{ext_id}/", json={"state": "stopped"})
+
+    async def unpark(self, ext_id: str, deadline: float) -> SshTarget:
+        # A stopped box restarts in seconds if its GPU is still free; if someone rented the GPU meanwhile it sits in
+        # "scheduling" indefinitely, which the deadline turns into a clean failure (the caller destroys it).
+        await self._req("PUT", f"{API}/instances/{ext_id}/", json={"state": "running"})
+        return await self.wait_ready(ext_id, deadline, grace_s=60)
 
     async def destroy(self, ext_id: str) -> None:
         for _ in range(6):
@@ -223,8 +234,10 @@ class Vast(Provider):
             d = await self._req("GET", f"{API1}/instances/", params=params)
             for i in d.get("instances", []):
                 st = i.get("actual_status") or i.get("cur_state") or ""
+                parked = i.get("intended_status") == "stopped"
                 out.append(RemoteBox(ext_id=str(i["id"]), label=i.get("label") or "", status=st,
-                                     terminal=st in TERMINAL, created_at=float(i.get("start_date") or 0),
+                                     terminal=st in TERMINAL and not parked,
+                                     created_at=float(i.get("start_date") or 0),
                                      price_h=float(i.get("dph_total") or 0)))
             token = d.get("next_token")
             if not token:
