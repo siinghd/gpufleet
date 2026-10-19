@@ -1316,6 +1316,8 @@ class Fleet:
                             prepaid=bool(row["prepaid"]), spot=bool(row["spot"]), machine_id=row["machine_id"] or "",
                             host_id=row["host_id"] or "", status=row["status"], created=row["created_at"])
                 box.profile = row["profile"] or box.profile
+                # prepaid burn rate (Colab CU/h) lives in the offer: without it a reattached box accrues no units
+                box.units_h = float((json.loads(row["offer"] or "{}").get("raw") or {}).get("cu_per_h") or 0)
                 self.boxes[box.id] = box
                 try:
                     await self._connect(box, SshTarget(**json.loads(row["ssh"])), prov, fresh=False)
