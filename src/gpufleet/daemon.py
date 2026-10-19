@@ -111,6 +111,11 @@ class Fleet:
         self._ckpt_at: dict[str, float] = {}  # task id -> last checkpoint pull
         self._ckpt_busy: set[str] = set()
         self.warm: dict[str, dict] = {}  # profile -> {"boxes": n, "until": t, "need": Need}
+        self.blobs = None
+        bc = cfg.get("blobs") or {}
+        if bc.get("backend") == "local" or (bc.get("env_file") and os.path.exists(os.path.expanduser(bc["env_file"]))):
+            from .blobs import Blobs
+            self.blobs = Blobs(bc, self.state_dir / "blob-cache")
 
     # =========================================================================================== jobs and tasks
     def submit(self, spec: JobSpec) -> str:
@@ -241,6 +246,13 @@ class Fleet:
         async def push(s: Sync):
             async with sem:
                 dst = s.dst if s.dst.startswith("/") else f"{ws}/{s.dst}"
+                if s.via == "r2" and self.blobs is not None:
+                    digest, url = await self.blobs.stage(s.src, s.exclude)
+                    rc, out = await box.transport.exec(self.blobs.fetch_cmd(url, digest, box.transport.abspath(dst)),
+                                                       timeout=3600)
+                    if rc == 0:
+                        return
+                    log.warning("blob fetch on %s failed (rc=%s), falling back to rsync: %s", box.id, rc, out[-200:])
                 await box.transport.push(Sync(src=s.src, dst=dst, exclude=s.exclude, delete=s.delete,
                                               include=s.include))
 
@@ -311,12 +323,23 @@ class Fleet:
     async def _pull_outputs(self, box: BoxRT, spec: JobSpec, task: dict) -> None:
         """Outputs of a finished task, with retries: a link that drops for a minute must not cost the render."""
         delays = [5, 15, 40]
+
+        async def one(s: Sync):
+            src = self._box_path(spec, s.src, task)
+            dst = self._subst(s.dst, task, spec)
+            if s.via == "r2" and self.blobs is not None and src.endswith("/"):
+                key, url = self.blobs.output_slot(task["id"])
+                rc, out = await box.transport.exec(self.blobs.upload_cmd(url, box.transport.abspath(src)), 1800)
+                if rc == 0:
+                    await self.blobs.collect(key, dst)
+                    return
+                log.warning("blob upload from %s failed (rc=%s), falling back to rsync", box.id, rc)
+            await box.transport.pull(Sync(src=src, dst=dst, exclude=s.exclude, include=s.include))
+
         for attempt in range(len(delays) + 1):
             try:
                 async with self._pulls:
-                    await asyncio.gather(*(box.transport.pull(Sync(
-                        src=self._box_path(spec, s.src, task), dst=self._subst(s.dst, task, spec),
-                        exclude=s.exclude, include=s.include)) for s in spec.outputs))
+                    await asyncio.gather(*(one(s) for s in spec.outputs))
                 return
             except TransportError:
                 if attempt == len(delays):

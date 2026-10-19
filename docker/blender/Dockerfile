@@ -42,7 +42,7 @@ ENV DEBIAN_FRONTEND=noninteractive NVIDIA_DRIVER_CAPABILITIES=all NVIDIA_VISIBLE
 # Runtime libraries Blender needs headless (X/GL client libs are linked even in background mode), EGL via glvnd for
 # EEVEE, python3 + numpy for scene scripts and checks, rsync/openssh for gpufleet.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl rsync openssh-server python3 python3-numpy \
+      ca-certificates curl rsync zstd openssh-server python3 python3-numpy \
       libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libgl1 libegl1 libglvnd0 libvulkan1 \
     && rm -rf /var/lib/apt/lists/* \
     # A public image must not ship SSH host keys (every box would share them): delete the ones the package made and

@@ -38,6 +38,8 @@ DEFAULTS: dict = {
                   "ssh_key": "~/.ssh/id_ed25519_gpufleet"},
     },
     "profiles": {},  # extra/overridden profiles, see profiles/__init__.py
+    # Object store for "via": "r2" transfers (blobs.py); active once the env file exists.
+    "blobs": {"env_file": str(CONFIG_DIR / "r2.env"), "prefix": "gpufleet/"},
 }
 
 

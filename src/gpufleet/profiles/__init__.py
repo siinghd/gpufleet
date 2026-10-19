@@ -14,9 +14,10 @@ from __future__ import annotations
 COMMON = r"""
 set -u
 mkdir -p /work /var/lib/gpufleet /var/cache/gpufleet
-command -v rsync >/dev/null && command -v python3 >/dev/null || {
+command -v rsync >/dev/null && command -v python3 >/dev/null && command -v zstd >/dev/null && command -v curl >/dev/null || {
   export DEBIAN_FRONTEND=noninteractive
-  (apt-get -qq update && apt-get -qq install -y rsync python3) >/dev/null 2>&1
+  (apt-get -qq install -y rsync python3 zstd curl || (apt-get -qq update && apt-get -qq install -y rsync python3 zstd \
+     curl)) >/dev/null 2>&1
 }
 command -v rsync >/dev/null || { echo "GF_FAIL no rsync"; exit 1; }
 command -v python3 >/dev/null || { echo "GF_FAIL no python3"; exit 1; }

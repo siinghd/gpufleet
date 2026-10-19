@@ -356,3 +356,24 @@ async def test_broken_setup_fails_the_job_and_keeps_the_box(tmp):
     assert st["status"] == "failed"
     assert len(prov.launched) == 1 and list(prov.live)  # not destroyed, not replaced
     await fleet.shutdown(destroy=True)
+
+
+async def test_inputs_and_outputs_through_the_blob_store(tmp):
+    import shutil as _sh
+    if not _sh.which("zstd"):
+        pytest.skip("zstd not installed")
+    src = tmp / "big-input"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub/data.bin").write_bytes(b"x" * 100_000)
+    prov = Fake()
+    fleet = Fleet(make_cfg(tmp, blobs={"backend": "local", "root": str(tmp / "store")}), {"fake": prov},
+                  local_boxes=True)
+    cmd = "mkdir -p out && wc -c < in/sub/data.bin > out/size.txt"
+    jid = fleet.submit(spec(tmp, units=["a"], command=cmd,
+                            inputs=[{"src": str(src) + "/", "dst": "in/", "via": "r2"}],
+                            outputs=[{"src": "out/", "dst": str(tmp / "got") + "/", "via": "r2"}]))
+    assert (await run_until(fleet, jid))["status"] == "done"
+    assert (tmp / "got/size.txt").read_text().strip() == "100000"
+    assert list((tmp / "store/gpufleet/blobs").glob("*.tar.zst"))  # the input went through the store
+    assert not list((tmp / "store/gpufleet/out").glob("*"))  # collected outputs are deleted from the store
+    await fleet.shutdown(destroy=True)

@@ -84,13 +84,14 @@ class Sync:
     exclude: tuple[str, ...] = ()
     delete: bool = False
     include: tuple[str, ...] = ()  # if set: only these patterns (directories are always traversed)
+    via: str = ""  # "r2": through the object store (blobs.py) when one is configured, else rsync
 
     @classmethod
     def parse(cls, d: dict | str) -> "Sync":
         if isinstance(d, str):
             return cls(src=d, dst=d)
         return cls(src=d["src"], dst=d.get("dst", d["src"]), exclude=tuple(d.get("exclude", ())),
-                   delete=bool(d.get("delete", False)), include=tuple(d.get("include", ())))
+                   delete=bool(d.get("delete", False)), include=tuple(d.get("include", ())), via=d.get("via", ""))
 
     def filters(self) -> list[str]:
         """rsync filter arguments: excludes first, then the include whitelist."""
