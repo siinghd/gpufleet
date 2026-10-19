@@ -37,7 +37,7 @@ echo "GF_CPU $(nproc)"
 BLENDER = r"""
 BV=${GF_BLENDER_VERSION:-5.2.2}
 BLSHA=${GF_BLENDER_SHA256:-84098912789dc450e95697c4184fb8a90acbe5111c2ba4aede3fecb57806a168}
-B=$(command -v blender || true)
+B=$(readlink -f "$(command -v blender || true)" 2>/dev/null || true)
 [ -z "$B" ] && [ -x /opt/blender/blender ] && B=/opt/blender/blender
 if [ -n "$B" ] && "$B" -b --factory-startup -noaudio --version 2>/dev/null | grep -q "Blender $BV"; then :; else
   # download.blender.org sometimes truncates or serves HTML: try mirrors in turn, check the hash.
@@ -55,7 +55,8 @@ if [ -n "$B" ] && "$B" -b --factory-startup -noaudio --version 2>/dev/null | gre
          libsm6 libxkbcommon0)) >/dev/null 2>&1
   B=/opt/blender/blender
 fi
-ln -sf "$B" /usr/local/bin/blender 2>/dev/null || true
+# Put it on PATH unless it already is (never link a path onto itself).
+[ "$(readlink -f /usr/local/bin/blender 2>/dev/null)" = "$B" ] || ln -sf "$B" /usr/local/bin/blender
 "$B" -b --factory-startup -noaudio --version 2>/dev/null | head -1 | sed 's/^/GF_BLENDER /'
 # GPU self-test before the box takes work (measured 19 Oct 2026: a Vast 4090 host passed nvidia-smi but could not
 # load OptiX kernels, and its EEVEE fell back to software at 45 s/frame). 64x64, 1 sample, a few seconds; it also
