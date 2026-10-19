@@ -110,9 +110,9 @@ BUILTIN: dict[str, dict] = {
         "caches": [],
     },
     "blender": {
-        # Prebaked toon-studio render box: Blender 5.2.2, Node, ffmpeg 7, Chrome. Any image with blender on PATH
-        # (or none: the bootstrap installs it) works.
-        "vast_image": "ghcr.io/siinghd/numora-render-box:5.2.2-20261008",
+        # docker/blender: Blender 5.2.2 + NVENC ffmpeg + python3/numpy on Ubuntu, 608 MB zstd (built by CI). Any
+        # image with blender on PATH works (or none: the bootstrap installs Blender).
+        "vast_image": "ghcr.io/siinghd/gpufleet-blender:5.2.2",
         "disk_gb": 40,
         "bootstrap": COMMON + BLENDER,
         "env": {
@@ -128,6 +128,10 @@ BUILTIN: dict[str, dict] = {
         "caches": ["/var/cache/gpufleet/optix", "/var/cache/gpufleet/glcache"],
     },
 }
+
+
+# Same software plus Node and Chrome (page exports): the toon-studio render box, 990 MB.
+BUILTIN["blender-full"] = {**BUILTIN["blender"], "vast_image": "ghcr.io/siinghd/numora-render-box:5.2.2-20261008"}
 
 
 def get(name: str, overrides: dict | None = None) -> dict:

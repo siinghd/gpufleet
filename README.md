@@ -98,8 +98,10 @@ recorded.
 ## Profiles
 
 A profile is the software a box needs: an image for Docker providers and an idempotent bootstrap that installs or
-verifies the same on providers without Docker (Colab). Built in: `base` and `blender` (Blender 5.2.2, OptiX/GL
-cache settings, Colab's missing NVIDIA EGL vendor registered so EEVEE runs on the GPU). Add your own under
+verifies the same on providers without Docker (Colab). Built in: `base`, and `blender`: the
+[docker/blender](docker/blender/Dockerfile) image (`ghcr.io/siinghd/gpufleet-blender:5.2.2`, Blender 5.2.2 + NVENC ffmpeg,
+608 MB zstd), OptiX/GL cache settings, Colab's missing NVIDIA EGL vendor registered, and a 64x64 OptiX + EEVEE
+self-test that rejects broken GPU hosts before they take work. Add your own under
 `[profiles.<name>]` in the config (`vast_image`, `bootstrap_extra`, `env`, `caches`).
 
 ## Tests
