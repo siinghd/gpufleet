@@ -156,6 +156,9 @@ class Vast(Provider):
         try:
             r = await self._req("PUT", f"{API}/asks/{offer.offer_id}/", json=body)
         except ProviderError as e:
+            if self._offer_cache:  # a stale listing: never hand it out again from the cache
+                t, k, offers = self._offer_cache
+                self._offer_cache = (t, k, [o for o in offers if o.offer_id != offer.offer_id])
             raise ProviderError(f"create failed for offer {offer.offer_id}: {e}", retry_other=True)
         ext = r.get("new_contract")
         if not ext:

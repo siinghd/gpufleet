@@ -89,14 +89,15 @@ if "llvmpipe" in r or "softpipe" in r or "swrast" in r:
     print("GF_SELFTEST_FAIL EEVEE on a software renderer:", r); sys.exit(3)
 print("GF_SELFTEST_OK cycles_s=%.1f eevee_s=%.1f gl=%s" % (tc, te, r))
 PY
-  st=$(timeout 300 "$B" -b --factory-startup -noaudio -P /tmp/gf_selftest.py 2>&1)
+  st=$(timeout 300 "$B" -b --factory-startup -noaudio -P /tmp/gf_selftest.py 2>&1 </dev/null)
   echo "$st" | grep -E '^GF_SELFTEST' | head -2
   if ! echo "$st" | grep -q '^GF_SELFTEST_OK'; then
-    echo "$st" | grep -iE 'optix|cuda|egl|error' | head -5
+    echo "$st" | tail -n 15 | sed 's/^/GF_LOG /'
     echo "GF_FAIL gpu self-test"; exit 3
   fi
-  echo "$st" | grep -qiE 'Failed to load OptiX kernel|OPTIX_ERROR' && { echo "GF_FAIL optix kernel load"; exit 3; }
+  if echo "$st" | grep -qiE 'Failed to load OptiX kernel|OPTIX_ERROR'; then echo "GF_FAIL optix kernel load"; exit 3; fi
 fi
+true
 """
 
 BUILTIN: dict[str, dict] = {

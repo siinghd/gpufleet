@@ -80,11 +80,12 @@ class SshTransport(Transport):
             return
         loop = asyncio.get_running_loop()
         end = loop.time() + timeout
-        last = ""
+        last = master_err = ""
         while loop.time() < end:
             if self.master is None or self.master.returncode is not None:
                 if self.master is not None and self.master.stderr:
-                    last = (await self.master.stderr.read()).decode(errors="replace").strip()[-300:] or last
+                    master_err = (await self.master.stderr.read()).decode(errors="replace").strip()[-300:] \
+                        or master_err
                 # ssh keeps the FIRST value of an option, so the master's own settings go before self.opts. With
                 # ControlPersist the master would fork into the background and look dead to us.
                 self.master = await asyncio.create_subprocess_exec(
@@ -104,7 +105,7 @@ class SshTransport(Transport):
             last = out.strip()[-300:] or last
         if self.master and self.master.returncode is None:
             self.master.kill()
-        raise TransportError(f"ssh not reachable within {timeout:.0f}s: {last}", rc=255)
+        raise TransportError(f"ssh not reachable within {timeout:.0f}s: {master_err or last}", rc=255)
 
     async def close(self) -> None:
         if self.master and self.master.returncode is None:

@@ -704,8 +704,14 @@ class Fleet:
                     name, drv = [x.strip() for x in out.strip().split(",", 1)]
                     box.gpu, box.driver = name.replace("NVIDIA ", "") or box.gpu, drv
                 await self._restore_caches(box, prof)  # before bootstrap: its GPU self-test then hits warm caches
-            rc, out = await box.transport.exec("bash -s", timeout=900, stdin=prof["bootstrap"].encode()) \
-                if not self.local_boxes else (0, "GF_OK local")
+            if self.local_boxes:
+                rc, out = 0, "GF_OK local"
+            else:
+                # Write the script to a file and run it with stdin closed: piped through `bash -s`, any command that
+                # reads stdin (Blender does) swallows the rest of the script.
+                rc, out = await box.transport.exec("cat > /tmp/gf_bootstrap.sh", 60, stdin=prof["bootstrap"].encode())
+                if rc == 0:
+                    rc, out = await box.transport.exec("bash /tmp/gf_bootstrap.sh </dev/null 2>&1", timeout=900)
             for line in out.splitlines():
                 if line.startswith("GF_GPU "):
                     parts = [x.strip() for x in line[7:].split(",")]
