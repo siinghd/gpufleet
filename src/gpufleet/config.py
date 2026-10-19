@@ -25,7 +25,8 @@ DEFAULTS: dict = {
     "idle_s": 300,  # an idle box is kept this long for reuse
     "reuse_max_age_s": 4800,  # no new work after this age (boxes get flaky, contracts end)
     "hard_ttl_s": 7200,  # destroyed at this age no matter what (the box also self-destroys on Vast)
-    "boot_timeout_s": 600,
+    "boot_timeout_s": 480,  # a host still pulling the image after 8 min is a slow host: destroy, rent another
+    "max_parallel_boots": 3,
     "boot_retries": 3,
     "max_lanes_per_gpu": 4,
     "lane_autoscale": True,

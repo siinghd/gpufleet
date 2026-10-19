@@ -697,6 +697,13 @@ class Fleet:
         state = "/var/lib/gpufleet" if not self.local_boxes else f"{box.transport.root}/../state"
         agent_path = "/opt/gpufleet/agent.py" if not self.local_boxes else f"{box.transport.root}/../agent.py"
         if fresh:
+            if not self.local_boxes:
+                rc, out = await box.transport.exec(
+                    "nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1", 60)
+                if rc == 0 and "," in out:
+                    name, drv = [x.strip() for x in out.strip().split(",", 1)]
+                    box.gpu, box.driver = name.replace("NVIDIA ", "") or box.gpu, drv
+                await self._restore_caches(box, prof)  # before bootstrap: its GPU self-test then hits warm caches
             rc, out = await box.transport.exec("bash -s", timeout=900, stdin=prof["bootstrap"].encode()) \
                 if not self.local_boxes else (0, "GF_OK local")
             for line in out.splitlines():
@@ -710,7 +717,9 @@ class Fleet:
                 raise TransportError(f"bootstrap failed rc={rc}: {out[-600:]}", rc or 1)
             await box.transport.exec(f"mkdir -p {os.path.dirname(agent_path)}", 60)
             await box.transport.push(Sync(src=str(AGENT_SRC), dst=agent_path))
-            await self._restore_caches(box, prof)
+            st = next((l for l in out.splitlines() if l.startswith("GF_SELFTEST_OK")), "")
+            if st:
+                self.store.event("selftest", box.id, result=st[15:])
         n = max(1, round(box.num_gpus / max(self._min_share(box), 0.01)))
         if not box.lanes:
             box.lanes = [Lane() for _ in range(n)]
@@ -867,7 +876,8 @@ class Fleet:
 
     async def scale(self) -> None:
         alive = [b for b in self.boxes.values() if b.status not in ("destroying", "destroyed", "parked")]
-        if len(alive) >= int(self.cfg["max_boxes"]) or self.launching:
+        if (len(alive) >= int(self.cfg["max_boxes"])
+                or len(self.launching) >= int(self.cfg.get("max_parallel_boots", 3))):
             return
         # Warm pool: keep N ready boxes of a profile for a while (seconds-latency for the next job).
         for prof, w in list(self.warm.items()):

@@ -57,6 +57,46 @@ if [ -n "$B" ] && "$B" -b --factory-startup -noaudio --version 2>/dev/null | gre
 fi
 ln -sf "$B" /usr/local/bin/blender 2>/dev/null || true
 "$B" -b --factory-startup -noaudio --version 2>/dev/null | head -1 | sed 's/^/GF_BLENDER /'
+# GPU self-test before the box takes work (measured 19 Oct 2026: a Vast 4090 host passed nvidia-smi but could not
+# load OptiX kernels, and its EEVEE fell back to software at 45 s/frame). 64x64, 1 sample, a few seconds; it also
+# warms the OptiX and shader caches for the real renders.
+if [ "${GF_SELFTEST:-1}" = 1 ] && command -v nvidia-smi >/dev/null; then
+  cat > /tmp/gf_selftest.py <<'PY'
+import sys, time
+import bpy
+s = bpy.context.scene
+s.render.resolution_x = s.render.resolution_y = 64
+p = bpy.context.preferences.addons["cycles"].preferences
+p.compute_device_type = "OPTIX"
+p.refresh_devices()
+if not [d for d in p.devices if d.type == "OPTIX"]:
+    print("GF_SELFTEST_FAIL no OptiX device"); sys.exit(3)
+for d in p.devices:
+    d.use = d.type == "OPTIX"
+s.render.engine = "CYCLES"; s.cycles.device = "GPU"; s.cycles.samples = 1
+s.render.filepath = "/tmp/gf_st_cycles.png"
+t = time.time(); bpy.ops.render.render(write_still=True); tc = time.time() - t
+for name in ("BLENDER_EEVEE", "BLENDER_EEVEE_NEXT"):
+    try:
+        s.render.engine = name; break
+    except TypeError:
+        pass
+s.render.filepath = "/tmp/gf_st_eevee.png"
+t = time.time(); bpy.ops.render.render(write_still=True); te = time.time() - t
+import gpu
+r = gpu.platform.renderer_get().lower()
+if "llvmpipe" in r or "softpipe" in r or "swrast" in r:
+    print("GF_SELFTEST_FAIL EEVEE on a software renderer:", r); sys.exit(3)
+print("GF_SELFTEST_OK cycles_s=%.1f eevee_s=%.1f gl=%s" % (tc, te, r))
+PY
+  st=$(timeout 300 "$B" -b --factory-startup -noaudio -P /tmp/gf_selftest.py 2>&1)
+  echo "$st" | grep -E '^GF_SELFTEST' | head -2
+  if ! echo "$st" | grep -q '^GF_SELFTEST_OK'; then
+    echo "$st" | grep -iE 'optix|cuda|egl|error' | head -5
+    echo "GF_FAIL gpu self-test"; exit 3
+  fi
+  echo "$st" | grep -qiE 'Failed to load OptiX kernel|OPTIX_ERROR' && { echo "GF_FAIL optix kernel load"; exit 3; }
+fi
 """
 
 BUILTIN: dict[str, dict] = {
