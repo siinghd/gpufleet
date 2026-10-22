@@ -68,7 +68,9 @@ def canonical(name: str) -> str:
 
 
 def info(name: str) -> dict:
-    return GPUS.get(canonical(name), {"score": 3000, "rt": True, "nvenc": True, "vram": 0})
+    # Unknown cards fail closed: an unlisted GPU is usually an old one (a GTX 1070 once passed an rt_cores job as
+    # "score 3000, rt" and won on price), so it gets no RT cores, no NVENC and the lowest score until it is listed.
+    return GPUS.get(canonical(name), {"score": 0, "rt": False, "nvenc": False, "vram": 0})
 
 
 def prior_secs_per_unit(gpu: str, unit_cost_s: float) -> float:
