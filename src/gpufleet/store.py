@@ -56,6 +56,14 @@ CREATE TABLE IF NOT EXISTS spend (
   PRIMARY KEY (day, provider)
 );
 
+-- Each project's share of the same spend (budgets.<project>). Added Oct 2026; CREATE IF NOT EXISTS gives older
+-- databases the table on open, and their per-provider history in `spend` stays as it was.
+CREATE TABLE IF NOT EXISTS spend_project (
+  day TEXT NOT NULL, project TEXT NOT NULL, provider TEXT NOT NULL,
+  usd REAL NOT NULL DEFAULT 0, units REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, project, provider)
+);
+
 CREATE TABLE IF NOT EXISTS perf (
   gpu TEXT NOT NULL, workload TEXT NOT NULL,
   secs_per_unit REAL NOT NULL, n INTEGER NOT NULL,
@@ -133,6 +141,20 @@ class Store:
         else:
             r = self.one("SELECT SUM(usd) AS usd FROM spend WHERE day=?", [self.today()])
         return float(r["usd"] or 0) if r else 0.0
+
+    def units_today(self, provider: str) -> float:
+        r = self.one("SELECT units FROM spend WHERE day=? AND provider=?", [self.today(), provider])
+        return float(r["units"] or 0) if r else 0.0
+
+    def add_project_spend(self, project: str, provider: str, usd: float, units: float = 0) -> None:
+        self.x("INSERT INTO spend_project VALUES (?,?,?,?,?) ON CONFLICT(day, project, provider) DO UPDATE SET "
+               "usd=usd+excluded.usd, units=units+excluded.units", [self.today(), project, provider, usd, units])
+
+    def project_spend_today(self, project: str) -> tuple[float, float]:
+        """(USD, prepaid units) the project spent today, over all providers."""
+        r = self.one("SELECT SUM(usd) AS usd, SUM(units) AS units FROM spend_project WHERE day=? AND project=?",
+                     [self.today(), project])
+        return (float(r["usd"] or 0), float(r["units"] or 0)) if r else (0.0, 0.0)
 
     # -- perf ----------------------------------------------------------------------------------------------------
     def learn(self, gpu: str, workload: str, secs_per_unit: float, alpha: float = 0.3) -> None:

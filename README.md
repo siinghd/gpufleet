@@ -21,7 +21,7 @@ Demucs, OCR, inference.
 | **Offer ranking** | Expected cost = price × (boot + work) / boot success rate + value of waiting time. Speed starts from Blender Open Data scores and is replaced by measured seconds-per-unit per GPU model and workload. A100/H100/T4 are excluded for RT-core jobs. |
 | **Packing** | Several tasks per GPU ("lanes"). A box whose lanes are all busy while the GPU is under 80 % busy and has VRAM to spare gets another lane. |
 | **Fast starts** | Idle boxes are *parked* (stopped, disk kept, storage-only billing) and restarted in seconds for the next job; a warm pool (`fleet warm`) keeps boxes ready; hosts that already ran our image (cached layers) rank as fast-booting; dispatch is event-driven. |
-| **Never leak billing** | Box rows are written before the provider is called; every box carries a label; a reconciler compares each provider's instance list with the database every minute and destroys our orphans, terminal boxes and boxes past their deadline (never anything without our label); Vast boxes also self-destruct at their deadline; per-day spend cap; provider credit / compute-unit floors. |
+| **Never leak billing** | Box rows are written before the provider is called; every box carries a label; a reconciler compares each provider's instance list with the database every minute and destroys our orphans, terminal boxes and boxes past their deadline (never anything without our label); Vast boxes also self-destruct at their deadline; per-day spend caps in USD and in prepaid units; per-project daily budgets; provider credit / compute-unit floors that also drain running boxes; alerts. |
 | **Failures** | Stale offers are skipped; boxes that never come up are destroyed and their machine recorded (a machine with 2 strikes in 14 days, or a host with 3 bad machines, is excluded from searches); heartbeats detect silent boxes; tasks over 3× their expected time are killed and moved; output pulls retry with backoff; a box that dies mid-task costs at most one checkpoint interval (partial results are pulled while the task runs and pushed back before the retry). |
 | **Restarts** | Tasks run detached on the box with their exit codes on disk. Restarting `fleetd` reattaches to every box and collects what finished meanwhile. |
 | **Compiler caches** | OptiX kernels and the NVIDIA GL shader cache are saved per (profile, GPU, driver) and restored on new boxes, so only the first box of a kind compiles. |
@@ -61,9 +61,45 @@ credit_floor_usd = 0.60
 
 [providers.colab]
 enabled = true
-cu_floor = 15        # stop launching here: Colab only allows SSH while the balance is positive
+cu_floor = 15        # no launches near it, running boxes drain under it: Colab drops SSH at 0
+daily_cap_units = 40 # compute units per UTC day, all projects together
+monthly_units = 200  # the plan's monthly grant, for the 50 % / 20 % alerts
 max_boxes = 1
 ```
+
+## Spending guardrails
+
+Prepaid units are not free: they are the month. In October 2026 one project's overnight render took the Colab
+balance from 200 CU to 0 in 36 hours, because the USD cap ignored prepaid units and the unit floor only stopped *new*
+boxes. Now:
+
+- **Daily caps.** `daily_cap_usd` covers paid providers; `providers.<name>.daily_cap_units` covers prepaid ones
+  (Colab default 40 CU, about 4.5 h of G4). A launch is refused when today's spend plus 15 more minutes of the
+  provider's boxes would pass the cap. When today's units reach it, the provider's boxes drain: each finishes its
+  current task and is destroyed, and none takes a new one. Caps reset at 00:00 UTC.
+- **Floor.** Under `cu_floor` (balance read by the reconciler every minute and by `fleet usage`), Colab boxes stop
+  taking tasks and are destroyed when their current task ends, idle ones at once (`provider_stopped` event).
+- **Project budgets.** Optional, per UTC day; without them only the global caps apply:
+
+  ```toml
+  [budgets.liftloom]
+  daily_usd = 3.0      # paid providers
+  daily_units = 20     # prepaid units
+  ```
+
+  A project over budget keeps its jobs queued (its running tasks finish) and no box takes its tasks until the next
+  day or a bigger budget. Spend is split across projects by the tasks in each box's lanes; idle and boot time goes
+  to the project the box last worked (or was rented) for.
+- **Alerts.** An `alert` event, at most once per alert per UTC day: a daily cap or a project budget hit, a prepaid
+  balance under 50 % or 20 % of `monthly_units`. Set `alert_cmd` (top level) to also run a command, with the alert
+  text appended as its last argument (10 s timeout; failures are logged and ignored), e.g. a phone push:
+
+  ```toml
+  alert_cmd = "ntfy publish my-gpufleet-alerts"   # runs: ntfy publish my-gpufleet-alerts "gpufleet: <alert>"
+  ```
+
+`fleet status` shows today's units against the cap, each project's spend against its budget, and why a queued job is
+held (its budget, or why renting a box for it was refused); `fleet usage` has the same as JSON.
 
 ## Jobs
 
@@ -121,7 +157,7 @@ self-test that rejects broken GPU hosts before they take work. Add your own unde
 The tests run the real scheduler and the real box agent against a fake provider whose boxes are local directories:
 units and ranges, retries, machine faults, stale offers, a box dying mid-render and the retry resuming from its
 checkpoint, a daemon crash and reattach, hung tasks, parking and restarting boxes, the warm pool, the daily cap,
-the reconciler.
+the reconciler, and the spending guardrails (unit caps and floors draining running boxes, project budgets, alerts).
 
 ## License
 

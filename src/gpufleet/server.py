@@ -120,12 +120,7 @@ class Server:
                                 "prepaid": o.prepaid, "machine": o.machine_id, "can_launch": ok, "why": why})
             return {"offers": out}
         if op == "usage":
-            bal = {}
-            for name, prov in f.providers.items():
-                try:
-                    bal[name] = await prov.balance()
-                except Exception as e:
-                    bal[name] = f"error: {e}"
+            bal = await f.refresh_balances()  # also what the unit floor and the balance alerts go by
             return {"balances": bal, **f.fleet_status()}
         if op == "events":
             rows = f.store.q("SELECT * FROM events ORDER BY at DESC LIMIT ?", [int(req.get("n", 50))])

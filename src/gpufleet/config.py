@@ -19,6 +19,10 @@ DEFAULTS: dict = {
     "socket": str(STATE_DIR / "fleetd.sock"),
     "db": str(STATE_DIR / "fleet.db"),
     "daily_cap_usd": 10.0,  # paid providers, all projects together
+    # Run on every alert (a daily cap or project budget hit, a prepaid balance under 50 % / 20 % of its month), with
+    # the alert text as the last argument; once per alert per UTC day. "" = alerts are only `alert` events.
+    "alert_cmd": "",
+    "budgets": {},  # [budgets.<project>] daily_usd / daily_units: per-project daily limits (none = only global caps)
     "max_boxes": 6,  # across providers
     "value_of_time_usd_per_h": 0.6,  # how much an hour of waiting is worth when ranking offers
     "scale_delay_s": 45,  # a queued task waits this long for a free lane before we rent another box
@@ -35,8 +39,10 @@ DEFAULTS: dict = {
     "providers": {
         "vast": {"enabled": True, "max_boxes": 5, "credit_floor_usd": 0.60, "max_bandwidth_usd_per_tb": 10,
                  "min_reliability": 0.98, "ssh_key": "~/.ssh/id_ed25519_vast"},
-        "colab": {"enabled": False, "max_boxes": 1, "cu_floor": 15, "accelerators": ["G4"], "shadow_factor": 0.35,
-                  "ssh_key": "~/.ssh/id_ed25519_gpufleet"},
+        # cu_floor: no launches near it, and running boxes drain under it. daily_cap_units: prepaid units per UTC
+        # day, all projects together (running boxes drain at it). monthly_units: the plan's grant, for alerts.
+        "colab": {"enabled": False, "max_boxes": 1, "cu_floor": 15, "daily_cap_units": 40, "monthly_units": 200,
+                  "accelerators": ["G4"], "shadow_factor": 0.35, "ssh_key": "~/.ssh/id_ed25519_gpufleet"},
     },
     "profiles": {},  # extra/overridden profiles, see profiles/__init__.py
     # Object store for "via": "r2" transfers (blobs.py); active once the env file exists.

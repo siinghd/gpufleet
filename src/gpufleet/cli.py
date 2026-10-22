@@ -8,7 +8,7 @@
   fleet cancel JOB
   fleet warm PROFILE [BOXES] [MINUTES] keep boxes ready ahead of work (seconds-latency starts)
   fleet offers [--profile P] [--max-price X] [--gpu]   what renting would cost right now
-  fleet usage                          spend today and provider balances
+  fleet usage                          spend today, unit caps, project budgets and provider balances
   fleet events [N]                     recent scheduler events
   fleet drain                          destroy idle boxes now, the rest when their tasks end
   fleet reconcile                      compare providers with the database now
@@ -41,6 +41,23 @@ def _fmt_ev(ev: dict) -> str:
     if kind == "final":
         return f"{ev.get('status').upper()}  cost ${ev.get('cost')}  tasks {json.dumps(ev.get('tasks'))}"
     return f"{kind:<6} " + json.dumps({k: v for k, v in ev.items() if k not in ('ev', 'job', 't')})
+
+
+def _guardrail_lines(out: dict) -> list[str]:
+    """Today's prepaid units against their cap and floor, and each project's spend against its budget."""
+    lines = []
+    for name, u in (out.get("units_today") or {}).items():
+        cap = f"/{u['cap']:g}" if u.get("cap") is not None else " (no cap)"
+        bal = f"  balance {u['balance']:.1f}" if u.get("balance") is not None else ""
+        extra = ", ".join(x for x in (f"floor {u['floor']:g}" if u.get("floor") is not None else "",
+                                      f"month {u['monthly_units']:g}" if u.get("monthly_units") else "") if x)
+        lines.append(f"units today {name} {u['units']:.1f}{cap}{bal}{f' ({extra})' if extra else ''}"
+                     f"{'  STOPPED: ' + u['stopped'] if u.get('stopped') else ''}")
+    for name, p in (out.get("projects") or {}).items():
+        usd = f"${p['usd']:.2f}" + (f"/${p['daily_usd']:.2f}" if p.get("daily_usd") is not None else "")
+        units = f"{p['units']:.1f}" + (f"/{p['daily_units']:g}" if p.get("daily_units") is not None else "")
+        lines.append(f"project {name}  {usd}  {units} units{'  HELD: ' + p['held'] if p.get('held') else ''}")
+    return lines
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -102,11 +119,14 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(out, indent=1))
                 return 0
             print(f"spend today {json.dumps(out['spend_today'])} (cap ${out['daily_cap_usd']})")
+            for line in _guardrail_lines(out):
+                print(line)
             for b in out["boxes"]:
                 print(f"  {b['id']}  {b['provider']:<6} {b['gpu']:<26} {b['status']:<9} {b['busy']}/{b['lanes']} lanes "
                       f"util {b['util']}%  ${b['price_h']}/h  {b['age_min']} min")
             for j in out["jobs"]:
-                print(f"  {j['id']}  {j['project']}/{j['name']}  {j['status']}  {json.dumps(j['tasks'])}  ${j['cost']}")
+                print(f"  {j['id']}  {j['project']}/{j['name']}  {j['status']}  {json.dumps(j['tasks'])}  ${j['cost']}"
+                      f"{'  held: ' + j['held'] if j.get('held') else ''}")
             return 0
         if a.cmd == "tasks":
             for t in cl.call("tasks", job=a.job)["tasks"]:
@@ -130,7 +150,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if a.cmd == "usage":
             out = cl.call("usage")
-            print(json.dumps({"balances": out["balances"], "spend_today": out["spend_today"]}, indent=1))
+            print(json.dumps({"balances": out["balances"], "spend_today": out["spend_today"],
+                              "units_today": out.get("units_today"), "projects": out.get("projects"),
+                              "held": {j["id"]: j["held"] for j in out["jobs"] if j.get("held")}}, indent=1))
             return 0
         if a.cmd == "events":
             for ev in reversed(cl.call("events", n=a.n)["events"]):

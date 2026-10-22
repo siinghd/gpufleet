@@ -10,6 +10,8 @@ Loop, every second:
   5. lanes     - a box whose lanes are all busy but whose GPU is under-used (and has VRAM to spare) gets a lane more
 Every reconcile_s the reconciler compares each provider's instance list with the database and destroys anything of
 ours that is unknown, terminal or past its deadline. Spend is accrued every tick from the boxes' hourly prices.
+Guardrails, every tick: a prepaid provider at its daily unit cap or under its unit floor drains its boxes (each finishes
+its task, then goes); a project over its daily budget gets no new tasks; caps, budgets and low balances raise alerts.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from .transport import LocalTransport, SshTransport, Transport, TransportError
 log = logging.getLogger("gpufleet")
 AGENT_SRC = Path(__file__).with_name("agent.py")
 MACHINE_FAULT_RCS = {3, 75}  # job scripts exit 3 for "no usable GPU" (toon-studio LIB_REQUIRE_GPU), 75 = bad box
+ALERT_CMD_TIMEOUT_S = 10.0
 
 
 class SetupError(TransportError):
@@ -66,6 +69,7 @@ class BoxRT:
     machine_id: str = ""
     host_id: str = ""
     profile: str = "base"
+    project: str = ""  # whose work it last ran (or was rented for): idle and boot time is charged to that project
     driver: str = ""
     ncpu: int = 0
     status: str = "requested"
@@ -111,6 +115,11 @@ class Fleet:
         self._ckpt_at: dict[str, float] = {}  # task id -> last checkpoint pull
         self._ckpt_busy: set[str] = set()
         self.warm: dict[str, dict] = {}  # profile -> {"boxes": n, "until": t, "need": Need}
+        self.balances: dict[str, float] = {}  # provider -> last known balance (USD, or units for prepaid providers)
+        self.stopped: dict[str, str] = {}  # prepaid provider -> why its boxes take no work (unit cap, floor)
+        self.holds: dict[str, str] = {}  # project -> why its jobs take no new tasks (daily budget)
+        self._blocked: dict[str, str] = {}  # job id -> why the last attempt to rent a box for it was refused
+        self._alerted: set[tuple[str, str]] = set()  # (day, alert key) already raised
         self.blobs = None
         bc = cfg.get("blobs") or {}
         if bc.get("backend") == "local" or (bc.get("env_file") and os.path.exists(os.path.expanduser(bc["env_file"]))):
@@ -146,6 +155,10 @@ class Fleet:
         rows = self.store.q("SELECT id FROM jobs WHERE status IN ('queued','running') ORDER BY created_at")
         jids = [r["id"] for r in rows]
         return sorted(jids, key=lambda j: -self._spec(j).priority)
+
+    def runnable_jobs(self) -> list[str]:
+        """Active jobs whose project is within its budget: the only ones that get new tasks or boxes."""
+        return [j for j in self.active_jobs() if self._spec(j).project not in self.holds]
 
     def _range_left(self, jid: str) -> int:
         spec = self._spec(jid)
@@ -281,6 +294,8 @@ class Fleet:
         msg = {"op": "run", "task": task["id"], "cmd": self._subst(spec.command, task, spec), "env": env,
                "cwd": self._workspace(spec), "gpu": gpu}
         box.lanes[lane] = Lane(task=task["id"], since=time.time())
+        box.project = spec.project
+        self._blocked.pop(jid, None)
         self.store.update("tasks", task["id"], status="running", box_id=box.id, started_at=time.time(),
                           attempt=task["attempt"] + (0 if dup_of else 1))
         self.store.x("UPDATE jobs SET status='running' WHERE id=? AND status='queued'", [jid])
@@ -413,9 +428,9 @@ class Fleet:
             box.proc.stdin.write((json.dumps(msg) + "\n").encode())
 
     def dispatch(self) -> None:
-        jobs = self.active_jobs()
+        jobs = self.runnable_jobs()
         for box in list(self.boxes.values()):
-            if box.status != "ready" or not box.free_lanes():
+            if box.status != "ready" or not box.free_lanes() or box.provider in self.stopped:
                 continue
             for jid in jobs:
                 spec = self._spec(jid)
@@ -463,7 +478,7 @@ class Fleet:
 
     def speculate(self) -> None:
         """Tail: duplicate the slowest running task of a job on an idle box that is at least as fast."""
-        for jid in self.active_jobs():
+        for jid in self.runnable_jobs():
             spec = self._spec(jid)
             if not spec.speculate or self.has_queued(jid):
                 continue
@@ -485,7 +500,7 @@ class Fleet:
                     continue
                 for box in self.boxes.values():
                     if (box.id == src.id or box.status != "ready" or box.busy() or not self._fits(spec, box)
-                            or box.prepared.get(jid) != "ok"):
+                            or box.prepared.get(jid) != "ok" or box.provider in self.stopped):
                         continue
                     if perf.info(box.gpu)["score"] < perf.info(src.gpu)["score"] * 0.9:
                         continue
@@ -678,7 +693,7 @@ class Fleet:
         for l in box.lanes:
             l.task = None
 
-    async def _launch(self, offer: Offer, need: Need) -> None:
+    async def _launch(self, offer: Offer, need: Need, project: str = "") -> None:
         """Rent, boot, bootstrap and connect one box; on failure try the next offer (other machine) a few times."""
         prov = self.providers[offer.provider]
         prof = profiles.get(need.profile, self.cfg.get("profiles"))
@@ -695,7 +710,7 @@ class Fleet:
             now = time.time()
             box = BoxRT(id=bid, provider=o.provider, gpu=o.gpu_name, num_gpus=o.num_gpus, price_h=o.price_h,
                         prepaid=o.prepaid, spot=o.spot, machine_id=o.machine_id, host_id=o.host_id,
-                        profile=need.profile, units_h=float(o.raw.get("cu_per_h") or 0))
+                        profile=need.profile, units_h=float(o.raw.get("cu_per_h") or 0), project=project)
             # Durable record first: if we die mid-launch the reconciler finds the label and destroys the box.
             self.store.x("INSERT INTO boxes (id, provider, label, status, offer, profile, gpu_name, num_gpus, price_h, "
                          "prepaid, spot, machine_id, host_id, created_at, hard_deadline) "
@@ -912,14 +927,43 @@ class Fleet:
         self.boxes.pop(box.id, None)
 
     # ================================================================================================= scaling
-    async def _budget_ok(self, offer: Offer) -> tuple[bool, str]:
+    async def _budget_ok(self, offer: Offer, project: str = "") -> tuple[bool, str]:
         if offer.prepaid:
+            ok, why = self._units_ok(offer.provider, float(offer.raw.get("cu_per_h") or 0))
+            if not ok:
+                return False, why
+        else:
+            spent = sum(self.store.spend_today(p) for p, prov in self.providers.items() if not prov.prepaid)
+            burn = sum(b.price_h for b in self.boxes.values() if not b.prepaid and b.status != "destroyed")
+            cap = float(self.cfg["daily_cap_usd"])
+            if spent + (burn + offer.price_h) * 0.25 > cap:  # leave room for 15 more minutes of the whole fleet
+                why = f"daily cap ${cap:.2f}: spent ${spent:.2f}, fleet burning ${burn:.2f}/h"
+                self.alert("cap:usd", why)
+                return False, why
+        # The project's own budget, with the same 15 minutes of room for the box we would rent for it.
+        b = (self.cfg.get("budgets") or {}).get(project) or {}
+        usd, units = self.store.project_spend_today(project) if b else (0.0, 0.0)
+        if not offer.prepaid and b.get("daily_usd") is not None \
+                and usd + offer.price_h * 0.25 > float(b["daily_usd"]):
+            return False, f"project {project} budget ${float(b['daily_usd']):.2f}/day: spent ${usd:.2f}"
+        if offer.prepaid and b.get("daily_units") is not None \
+                and units + float(offer.raw.get("cu_per_h") or 0) * 0.25 > float(b["daily_units"]):
+            return False, f"project {project} budget {float(b['daily_units']):g} units/day: spent {units:.1f}"
+        return True, ""
+
+    def _units_ok(self, provider: str, units_h: float) -> tuple[bool, str]:
+        """The prepaid twin of the USD cap: units spent today plus 15 more minutes of this provider's boxes and the
+        new one must stay under providers.<name>.daily_cap_units. Prepaid units are not free: they are the month."""
+        cap = self.cfg["providers"].get(provider, {}).get("daily_cap_units")
+        if cap is None:
             return True, ""
-        spent = sum(self.store.spend_today(p) for p, prov in self.providers.items() if not prov.prepaid)
-        burn = sum(b.price_h for b in self.boxes.values() if not b.prepaid and b.status != "destroyed")
-        cap = float(self.cfg["daily_cap_usd"])
-        if spent + (burn + offer.price_h) * 0.25 > cap:  # leave room for 15 more minutes of the whole fleet
-            return False, f"daily cap ${cap:.2f}: spent ${spent:.2f}, fleet burning ${burn:.2f}/h"
+        spent = self.store.units_today(provider)
+        burn = sum(b.units_h for b in self.boxes.values() if b.provider == provider
+                   and b.status not in ("destroyed", "parked"))
+        if spent + (burn + units_h) * 0.25 > float(cap):
+            why = f"{provider} daily cap {float(cap):g} units: spent {spent:.1f}, burning {burn:.1f}/h"
+            self.alert(f"cap:{provider}:units", why)
+            return False, why
         return True, ""
 
     def _can_take(self, jid: str, box: BoxRT) -> bool:
@@ -963,7 +1007,7 @@ class Fleet:
                 if best and (await self._budget_ok(best))[0]:
                     await self._spawn_launch(best, w["need"])
                     return
-        for jid in self.active_jobs():
+        for jid in self.runnable_jobs():
             spec = self._spec(jid)
             if not self.has_queued(jid):
                 continue
@@ -992,25 +1036,32 @@ class Fleet:
             if self.store.one("SELECT cost FROM jobs WHERE id=?", [jid])["cost"] >= spec.budget_usd:
                 self._notify(jid, ev="budget_reached", budget=spec.budget_usd)
                 continue
-            best = await self._best_offer(spec, pending)
+            reasons: list[str] = []
+            best = await self._best_offer(spec, pending, reasons)
             if not best:
+                if reasons:
+                    self._blocked[jid] = "; ".join(dict.fromkeys(reasons))
+                else:
+                    self._blocked.pop(jid, None)
                 continue
-            ok, why = await self._budget_ok(best)
+            ok, why = await self._budget_ok(best, spec.project)
             if not ok:
+                self._blocked[jid] = why
                 self._notify(jid, ev="blocked", why=why)
                 self.store.event("scale_blocked", jid, why=why)
                 continue
-            await self._spawn_launch(best, spec.need)
+            self._blocked.pop(jid, None)
+            await self._spawn_launch(best, spec.need, spec.project)
             self._notify(jid, ev="scaling", provider=best.provider, gpu=best.gpu_name, price_h=round(best.price_h, 3))
             return  # one launch per tick; the next tick sees the new box as booting capacity
 
-    async def _spawn_launch(self, offer: Offer, need: Need) -> None:
+    async def _spawn_launch(self, offer: Offer, need: Need, project: str = "") -> None:
         key = f"{offer.provider}:{offer.offer_id}"
         self.launching.add(key)
 
         async def go():
             try:
-                await self._launch(offer, need)
+                await self._launch(offer, need, project)
             finally:
                 self.launching.discard(key)
 
@@ -1018,7 +1069,7 @@ class Fleet:
 
     async def _try_unpark(self, profile: str, need: Need, spec: JobSpec | None = None) -> bool:
         for b in self.boxes.values():
-            if b.status != "parked" or b.profile != profile:
+            if b.status != "parked" or b.profile != profile or b.provider in self.stopped:
                 continue
             if need.providers and b.provider not in need.providers:
                 continue
@@ -1063,10 +1114,12 @@ class Fleet:
                 best = min(best, expect - elapsed if elapsed < expect else elapsed)
         return 0.0 if best == float("inf") else best
 
-    async def _best_offer(self, spec: JobSpec, pending_ref_s: float) -> Offer | None:
+    async def _best_offer(self, spec: JobSpec, pending_ref_s: float, why: list[str] | None = None) -> Offer | None:
         """Lowest expected cost of getting the queued work done on one new box of this offer:
             price x (boot + work_on_it) / boot_success_rate + value_of_time x (boot + work_on_it)
-        where work_on_it is capped at an hour (the box will not do everything alone if the queue is long)."""
+        where work_on_it is capped at an hour (the box will not do everything alone if the queue is long).
+        Providers that may not launch (floors, unit caps) are skipped; their reasons go to `why`."""
+        why = why if why is not None else []
         vot = float(self.cfg["value_of_time_usd_per_h"])
         cands: list[tuple[float, Offer]] = []
         for name, prov in self.providers.items():
@@ -1075,10 +1128,14 @@ class Fleet:
             mine = [b for b in self.boxes.values() if b.provider == name and b.status != "destroyed"]
             if len(mine) >= prov.max_boxes:
                 continue
+            if name in self.stopped:
+                why.append(self.stopped[name])
+                continue
             try:
-                ok, why = await prov.can_launch()
+                ok, reason = await prov.can_launch()
                 if not ok:
-                    self.store.event("provider_blocked", name, why=why)
+                    self.store.event("provider_blocked", name, why=reason)
+                    why.append(reason)
                     continue
                 bad_m, bad_h = self.store.bad_machines(name)
                 offers = await prov.offers(spec.need, bad_m, bad_h)
@@ -1092,6 +1149,11 @@ class Fleet:
             for o in offers:
                 if o.price_h > spec.need.max_price_h:
                     continue
+                if o.prepaid:
+                    ok, reason = self._units_ok(name, float(o.raw.get("cu_per_h") or 0))
+                    if not ok:
+                        why.append(reason)
+                        continue
                 if o.machine_id in good:
                     o = Offer(**{**o.__dict__, "boot_s": min(boot_med, 75)})  # image layers likely cached there
                 spu = self._secs_per_unit(spec, o.gpu_name) / spec.unit_cost_s  # box-seconds per reference-second
@@ -1125,7 +1187,7 @@ class Fleet:
             # Only worth a lane if queued work could actually run in it.
             if not any(self.has_queued(j) and self._fits(self._spec(j), b) and self._can_take(j, b)
                        and (not self._spec(j).max_per_box or self._running_on(j, b) < self._spec(j).max_per_box)
-                       for j in self.active_jobs()):
+                       for j in self.runnable_jobs()):
                 continue
             util = sum(t[1] for t in recent) / len(recent)
             mem = max(t[2] for t in recent)
@@ -1196,7 +1258,8 @@ class Fleet:
 
     async def lifecycle(self) -> None:
         now = time.time()
-        queued_any = any(self.has_queued(j) for j in self.active_jobs())
+        runnable = self.runnable_jobs()  # a held project's queue does not keep idle boxes alive
+        queued_any = any(self.has_queued(j) for j in runnable)
         for b in list(self.boxes.values()):
             row = self.store.one("SELECT hard_deadline FROM boxes WHERE id=?", [b.id])
             if (row and now > row["hard_deadline"] and b.status in ("ready", "draining") and b.busy()
@@ -1216,8 +1279,7 @@ class Fleet:
                 await self._destroy(b, "drained")
                 continue
             if b.status == "ready" and not b.busy():
-                usable = queued_any and any(self._fits(self._spec(j), b) and self.has_queued(j)
-                                            for j in self.active_jobs())
+                usable = queued_any and any(self._fits(self._spec(j), b) and self.has_queued(j) for j in runnable)
                 ready_same = sum(1 for x in self.boxes.values() if x.profile == b.profile and x.status == "ready")
                 if usable or ready_same <= self._warm_need(b.profile):
                     continue
@@ -1231,13 +1293,137 @@ class Fleet:
         self._last_accrue = now
         for b in self.boxes.values():
             if b.status == "parked":
-                self.store.add_spend(b.provider, 0.012 * dt / 3600)
+                self._charge(b, 0.012 * dt / 3600, 0)
                 continue
             if b.status in ("booting", "ready", "draining", "destroying", "unparking") and b.ext_id:
                 if b.prepaid:
-                    self.store.add_spend(b.provider, 0, b.units_h * dt / 3600)
+                    self._charge(b, 0, b.units_h * dt / 3600)
                 else:
-                    self.store.add_spend(b.provider, b.price_h * dt / 3600)
+                    self._charge(b, b.price_h * dt / 3600, 0)
+
+    def _charge(self, b: BoxRT, usd: float, units: float) -> None:
+        """Provider spend, and each project's share: the box is split evenly over the tasks in its lanes; an idle or
+        booting box is charged to the project it last worked (or was rented) for."""
+        self.store.add_spend(b.provider, usd, units)
+        live = [l.task for l in b.lanes if l.task]
+        projects = []
+        if live:
+            marks = ",".join("?" * len(live))
+            projects = [r["project"] for r in self.store.q(
+                f"SELECT j.project FROM tasks t JOIN jobs j ON j.id=t.job_id WHERE t.id IN ({marks})", live)]
+        projects = projects or ([b.project] if b.project else [])
+        for p in projects:
+            self.store.add_project_spend(p, b.provider, usd / len(projects), units / len(projects))
+
+    # ============================================================================================== guardrails
+    def guard(self) -> None:
+        """Spending guardrails on what already runs (the launch checks cover what would start):
+        - a prepaid provider whose units today reached providers.<name>.daily_cap_units, or whose balance fell under
+          its cu_floor, takes no new tasks: its boxes drain (the current task finishes, then the box goes; idle ones
+          go now). Running past the floor is how the balance reaches 0, and Colab drops SSH at 0.
+        - a project whose spend today reached budgets.<project> keeps its jobs queued; no box takes its tasks.
+        - prepaid balances under 50 % / 20 % of providers.<name>.monthly_units raise an alert."""
+        stopped: dict[str, str] = {}
+        for name, prov in self.providers.items():
+            if not prov.prepaid:
+                continue
+            pc = self.cfg["providers"].get(name, {})
+            bal = self.balances.get(name)
+            cap = pc.get("daily_cap_units")
+            units = self.store.units_today(name)
+            if cap is not None and units >= float(cap):
+                stopped[name] = f"{name} daily cap {float(cap):g} units reached: spent {units:.1f}"
+                self.alert(f"cap:{name}:units", stopped[name])
+            elif pc.get("cu_floor") is not None and bal is not None and bal < float(pc["cu_floor"]):
+                stopped[name] = f"{name} balance {bal:.1f} units is under the floor {float(pc['cu_floor']):g}"
+            monthly = float(pc.get("monthly_units") or 0)
+            if monthly and bal is not None:
+                for pct in (20, 50):  # only the lowest threshold crossed: one alert, not two, when it is low
+                    if bal < monthly * pct / 100:
+                        self.alert(f"balance:{name}:{pct}",
+                                   f"{name} balance {bal:.1f} units is under {pct}% of the month's {monthly:g}")
+                        break
+        for name, why in stopped.items():
+            if name not in self.stopped:
+                log.warning("%s: draining its boxes", why)
+                self.store.event("provider_stopped", name, why=why)
+            for b in self.boxes.values():
+                if b.provider == name and b.status == "ready":
+                    b.status = "draining"
+                    self.store.update("boxes", b.id, status="draining", note=why[:300])
+                    self.store.event("guard_drain", b.id, why=why, busy=b.busy())
+        for name in set(self.stopped) - set(stopped):
+            self.store.event("provider_resumed", name)
+        self.stopped = stopped
+
+        holds: dict[str, str] = {}
+        for project, b in (self.cfg.get("budgets") or {}).items():
+            usd, units = self.store.project_spend_today(project)
+            if b.get("daily_usd") is not None and usd >= float(b["daily_usd"]):
+                holds[project] = (f"project {project} daily budget ${float(b['daily_usd']):.2f} reached: "
+                                  f"spent ${usd:.2f}")
+                self.alert(f"budget:{project}:usd", holds[project])
+            elif b.get("daily_units") is not None and units >= float(b["daily_units"]):
+                holds[project] = (f"project {project} daily budget {float(b['daily_units']):g} units reached: "
+                                  f"spent {units:.1f}")
+                self.alert(f"budget:{project}:units", holds[project])
+        for project in set(holds) - set(self.holds):
+            self.store.event("project_held", project, why=holds[project])
+            for jid in self.active_jobs():
+                if self._spec(jid).project == project:
+                    self._notify(jid, ev="held", why=holds[project])
+        self.holds = holds
+
+    def alert(self, key: str, msg: str) -> None:
+        """Tell the owner, at most once per key per UTC day (restarts included): an `alert` event, and alert_cmd
+        with the message as its last argument when one is configured."""
+        day = self.store.today()
+        if (day, key) in self._alerted:
+            return
+        self._alerted.add((day, key))
+        now = time.time()
+        if self.store.one("SELECT 1 FROM events WHERE kind='alert' AND ref=? AND at>=?", [key, now - now % 86400]):
+            return
+        log.warning("ALERT %s", msg)
+        self.store.event("alert", key, msg=msg)
+        if self.cfg.get("alert_cmd"):
+            asyncio.get_running_loop().create_task(self._run_alert_cmd(str(self.cfg["alert_cmd"]), msg))
+
+    async def _run_alert_cmd(self, cmd: str, msg: str) -> None:
+        """An alert hook must never take the scheduler down: failures and hangs are logged and ignored."""
+        try:
+            argv = shlex.split(cmd)
+            argv[0] = os.path.expanduser(argv[0])
+            p = await asyncio.create_subprocess_exec(*argv, f"gpufleet: {msg}",
+                                                     stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                                                     stderr=asyncio.subprocess.STDOUT)
+            try:
+                out, _ = await asyncio.wait_for(p.communicate(), ALERT_CMD_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                p.kill()
+                await p.wait()
+                log.warning("alert_cmd timed out after %.0fs", ALERT_CMD_TIMEOUT_S)
+                return
+            if p.returncode:
+                log.warning("alert_cmd exited %s: %s", p.returncode, out.decode(errors="replace")[-300:])
+        except Exception as e:
+            log.warning("alert_cmd failed: %s", e)
+
+    async def refresh_balances(self, prepaid_only: bool = False) -> dict:
+        """Ask the providers for their balances; the floor and the monthly alerts use the last good answer."""
+        out: dict = {}
+        for name, prov in self.providers.items():
+            if prepaid_only and not prov.prepaid:
+                continue
+            try:
+                bal = await prov.balance()
+            except Exception as e:
+                out[name] = f"error: {e}"
+                continue
+            out[name] = bal
+            if bal is not None:
+                self.balances[name] = float(bal)
+        return out
 
     # ============================================================================================== reconciler
     async def reconcile(self) -> dict:
@@ -1294,6 +1480,7 @@ class Fleet:
                 self.store.update("boxes", row["id"], status="destroyed", destroyed_at=time.time(),
                                   note="vanished at provider")
                 report["gone"].append(ext)
+        await self.refresh_balances(prepaid_only=True)
         self._last_reconcile = time.time()
         return report
 
@@ -1346,6 +1533,7 @@ class Fleet:
 
     async def tick(self) -> None:
         self.accrue()
+        self.guard()
         self.watchdogs()
         self.dispatch()
         self.speculate()
@@ -1395,9 +1583,12 @@ class Fleet:
             return {"error": "no such job"}
         counts = {r["status"]: r["n"] for r in self.store.q(
             "SELECT status, COUNT(*) AS n FROM tasks WHERE job_id=? AND dup_of IS NULL GROUP BY status", [jid])}
+        # Why queued work is not running: its project's budget, or why renting a box for it was last refused.
+        held = (self.holds.get(j["project"]) or self._blocked.get(jid)) if j["status"] in ("queued", "running") \
+            and self.has_queued(jid) else None
         return {"id": jid, "project": j["project"], "name": j["name"], "status": j["status"],
                 "cost": round(j["cost"], 4), "tasks": counts, "range_left": self._range_left(jid),
-                "created": j["created_at"], "finished": j["finished_at"]}
+                "created": j["created_at"], "finished": j["finished_at"], "held": held}
 
     def fleet_status(self) -> dict:
         boxes = []
@@ -1409,4 +1600,22 @@ class Fleet:
         jobs = [self.job_status(j) for j in self.active_jobs()]
         spend = {r["provider"]: {"usd": round(r["usd"], 3), "units": round(r["units"], 2)} for r in self.store.q(
             "SELECT provider, usd, units FROM spend WHERE day=?", [self.store.today()])}
-        return {"boxes": boxes, "jobs": jobs, "spend_today": spend, "daily_cap_usd": self.cfg["daily_cap_usd"]}
+        units = {}
+        for name, prov in self.providers.items():
+            if prov.prepaid:
+                pc = self.cfg["providers"].get(name, {})
+                units[name] = {"units": round(self.store.units_today(name), 2), "cap": pc.get("daily_cap_units"),
+                               "balance": self.balances.get(name), "floor": pc.get("cu_floor"),
+                               "monthly_units": pc.get("monthly_units"), "stopped": self.stopped.get(name)}
+        budgets = self.cfg.get("budgets") or {}
+        projects = {}
+        names = {r["project"] for r in self.store.q("SELECT DISTINCT project FROM spend_project WHERE day=?",
+                                                    [self.store.today()])} | set(budgets)
+        for name in sorted(names):
+            usd, u = self.store.project_spend_today(name)
+            projects[name] = {"usd": round(usd, 3), "units": round(u, 2),
+                              "daily_usd": (budgets.get(name) or {}).get("daily_usd"),
+                              "daily_units": (budgets.get(name) or {}).get("daily_units"),
+                              "held": self.holds.get(name)}
+        return {"boxes": boxes, "jobs": jobs, "spend_today": spend, "daily_cap_usd": self.cfg["daily_cap_usd"],
+                "units_today": units, "projects": projects}

@@ -12,9 +12,11 @@ from .base import Provider, ProviderError
 
 class Fake(Provider):
     def __init__(self, name: str = "fake", offers: list[dict] | None = None, boot_s: float = 0.05,
-                 fail_launches: int = 0, max_boxes: int = 5, prepaid: bool = False, fail_boots: int = 0):
+                 fail_launches: int = 0, max_boxes: int = 5, prepaid: bool = False, fail_boots: int = 0,
+                 balance_units: float | None = None):
         self.name = name
         self.prepaid = prepaid
+        self.balance_units = balance_units  # what balance() reports (prepaid units or USD); None = unknown
         self.max_boxes = max_boxes
         self._offers = offers or [{"gpu_name": "RTX 4090", "price_h": 0.4}]
         self.boot_s = boot_s
@@ -76,3 +78,6 @@ class Fake(Provider):
 
     async def list_all(self) -> list[RemoteBox]:
         return list(self.live.values())
+
+    async def balance(self) -> float | None:
+        return self.balance_units
